@@ -1,0 +1,178 @@
+---
+# =============================================================================
+# ferria_agent role — installs and manages the Ferria GitOps agent itself
+# =============================================================================
+# This role is convergent and self-managing: it is applied on every
+# reconciliation run, so changes to variables (interval, jitter, wrapper
+# script) are automatically deployed from Git without manual intervention.
+# =============================================================================
+
+# --- Verify Ansible installation ---
+- name: Ensure Ansible is installed with pinned versions in venv
+  ansible.builtin.pip:
+    name:
+      - "ansible-core{{ ferria_ansible_core_version }}"
+      - "ansible{{ ferria_ansible_version }}"
+    state: present
+    virtualenv: "{{ ferria_venv_path }}"
+    virtualenv_command: python3 -m venv
+  tags: [ferria, ansible]
+
+# --- Verify SOPS installation ---
+- name: Check if SOPS binary is present
+  ansible.builtin.stat:
+    path: /usr/local/bin/sops
+  register: sops_stat
+  tags: [ferria, sops]
+
+- name: Fetch SOPS latest release info from GitHub
+  ansible.builtin.uri:
+    url: https://api.github.com/repos/getsops/sops/releases/latest
+    return_content: true
+    headers:
+      Accept: application/vnd.github.v3+json
+  register: sops_release
+  when: not sops_stat.stat.exists
+  tags: [ferria, sops]
+
+- name: Install SOPS binary
+  ansible.builtin.get_url:
+    url: >-
+      https://github.com/getsops/sops/releases/download/{{ sops_release.json.tag_name
+      }}/sops-{{ sops_release.json.tag_name }}.linux.{{
+      'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}
+    dest: /usr/local/bin/sops
+    mode: "0755"
+  when: not sops_stat.stat.exists
+  tags: [ferria, sops]
+
+# --- Verify age installation ---
+- name: Check if age binary is present
+  ansible.builtin.stat:
+    path: /usr/local/bin/age
+  register: age_stat
+  tags: [ferria, age]
+
+- name: Install age via system package manager
+  ansible.builtin.package:
+    name: age
+    state: present
+  when: not age_stat.stat.exists
+  ignore_errors: true  # noqa: ignore-errors — fall through to GitHub download
+  register: age_pkg
+  tags: [ferria, age]
+
+- name: Install age from GitHub releases (fallback when not in package repos)
+  when: not age_stat.stat.exists and (age_pkg is failed or age_pkg.changed is not defined)
+  tags: [ferria, age]
+  block:
+    - name: Fetch age latest release info from GitHub
+      ansible.builtin.uri:
+        url: https://api.github.com/repos/FiloSottile/age/releases/latest
+        return_content: true
+        headers:
+          Accept: application/vnd.github.v3+json
+      register: age_release
+
+    - name: Create temporary directory for age download
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: _age
+      register: age_tmpdir
+
+    - name: Download and extract age tarball
+      ansible.builtin.unarchive:
+        src: >-
+          https://github.com/FiloSottile/age/releases/download/{{ age_release.json.tag_name
+          }}/age-{{ age_release.json.tag_name }}-linux-{{
+          'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}.tar.gz
+        dest: "{{ age_tmpdir.path }}"
+        remote_src: true
+
+    - name: Install age and age-keygen binaries
+      ansible.builtin.copy:
+        src: "{{ age_tmpdir.path }}/age/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: "0755"
+        remote_src: true
+      loop:
+        - age
+        - age-keygen
+
+    - name: Remove age temporary directory
+      ansible.builtin.file:
+        path: "{{ age_tmpdir.path }}"
+        state: absent
+
+# --- Configuration directory ---
+- name: Ensure /etc/ferria configuration directory exists
+  ansible.builtin.file:
+    path: /etc/ferria
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  tags: [ferria, config]
+
+# --- Agent configuration file ---
+- name: Deploy agent configuration file
+  ansible.builtin.template:
+    src: agent.conf.j2
+    dest: /etc/ferria/agent.conf
+    owner: root
+    group: root
+    mode: "0600"
+  tags: [ferria, config]
+
+# --- Wrapper script ---
+- name: Ensure /opt/ferria directory exists
+  ansible.builtin.file:
+    path: /opt/ferria
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: [ferria, scripts]
+
+- name: Deploy ferria wrapper script
+  ansible.builtin.template:
+    src: ferria-wrapper.sh.j2
+    dest: /opt/ferria/ferria-wrapper.sh
+    owner: root
+    group: root
+    mode: "0755"
+  tags: [ferria, scripts]
+
+# --- Systemd service and timer units ---
+- name: Deploy ferria-agent systemd service unit
+  ansible.builtin.template:
+    src: ferria-agent.service.j2
+    dest: /etc/systemd/system/ferria-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart ferria timer
+  tags: [ferria, systemd]
+
+- name: Deploy ferria-agent systemd timer unit
+  ansible.builtin.template:
+    src: ferria-agent.timer.j2
+    dest: /etc/systemd/system/ferria-agent.timer
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart ferria timer
+  tags: [ferria, systemd]
+
+# --- Ensure timer is running ---
+- name: Ensure ferria-agent timer is enabled and started
+  ansible.builtin.systemd:
+    name: ferria-agent.timer
+    state: started
+    enabled: true
+    daemon_reload: true
+  tags: [ferria, systemd]

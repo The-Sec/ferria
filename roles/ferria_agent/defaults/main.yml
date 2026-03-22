@@ -1,0 +1,18 @@
+---
+# Default variables for the ferria_agent role.
+# These mirror group_vars/all.yml so the role works standalone.
+# Values set in group_vars/all.yml (or more specific scopes) take precedence.
+
+ferria_repo_url: "git@github.com:CHANGEME/infra.git"
+ferria_repo_branch: "main"
+ferria_repo_dest: "/opt/ferria/repo"
+ferria_pull_interval_min: 30
+ferria_jitter_enabled: false
+ferria_jitter_max_sec: 300
+ferria_commit_verify: false
+ferria_venv_path: "/opt/ferria/venv"
+ferria_age_key_path: "/etc/ferria/age-key.txt"
+ferria_ansible_core_version: ">=2.16,<2.18"
+ferria_ansible_version: ">=9.0,<11.0"
+ferria_only_if_changed: true
+ferria_clean_checkout: true

@@ -1,0 +1,40 @@
+---
+# =============================================================================
+# Ferria global defaults — applied to every host
+# =============================================================================
+# Override per group in group_vars/<groupname>.yml
+# Override per host in host_vars/<hostname>.yml
+# =============================================================================
+
+# --- Agent configuration ---
+ferria_repo_url: "git@github.com:CHANGEME/infra.git"
+ferria_repo_branch: "main"
+ferria_repo_dest: "/opt/ferria/repo"
+ferria_pull_interval_min: 30
+ferria_jitter_enabled: false
+ferria_jitter_max_sec: 300
+ferria_commit_verify: false
+ferria_venv_path: "/opt/ferria/venv"
+ferria_age_key_path: "/etc/ferria/age-key.txt"
+ferria_ssh_strict_host_key_checking: "accept-new"
+ferria_log_level: "info"
+
+# --- Reconciliation behaviour ---
+# Skip playbook run if no new commits since last pull (saves CPU).
+ferria_only_if_changed: true
+# Discard any local modifications to the working copy before pull.
+ferria_clean_checkout: true
+
+# --- Ansible version pins ---
+# The ferria_agent role verifies these on every run and upgrades if needed.
+ferria_ansible_core_version: ">=2.16,<2.18"
+ferria_ansible_version: ">=9.0,<11.0"
+
+# --- Package management ---
+# Extra system packages to ensure are present on every host.
+ferria_extra_packages: []
+# Example:
+# ferria_extra_packages:
+#   - htop
+#   - curl
+#   - jq

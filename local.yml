@@ -1,0 +1,59 @@
+---
+# =============================================================================
+# Ferria main playbook entrypoint
+# =============================================================================
+# This is the file that `ansible-pull` runs on each reconciliation tick.
+# Add your convergent roles under the `roles:` section, in dependency order.
+# =============================================================================
+
+- name: Ferria convergence run
+  hosts: localhost
+  connection: local
+  become: true
+
+  pre_tasks:
+    - name: Decrypt SOPS secrets if present
+      # Decrypts any *.sops.yml files found in group_vars/ and host_vars/
+      # using the age private key on this machine.
+      # Decrypted files are written as *.yml in the same directory and are
+      # available as standard Ansible variables for all subsequent roles.
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        if command -v sops &>/dev/null && [ -f "{{ ferria_age_key_path }}" ]; then
+          export SOPS_AGE_KEY_FILE="{{ ferria_age_key_path }}"
+
+          while IFS= read -r -d '' f; do
+            target="${f%.sops.yml}.yml"
+            tmp_file="$(mktemp "${target}.XXXXXX")"
+            sops -d "$f" > "$tmp_file"
+            mv "$tmp_file" "$target"
+          done < <(
+            find "{{ ferria_repo_dest }}/group_vars" "{{ ferria_repo_dest }}/host_vars" \
+              -type f -name '*.sops.yml' -print0 2>/dev/null
+          )
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+      tags: [always]
+
+  roles:
+    # The agent always manages itself first. Changes to ferria_agent role
+    # variables (interval, jitter, etc.) are applied on the next run.
+    - role: ferria_agent
+      tags: [ferria, agent]
+
+    # -------------------------------------------------------------------------
+    # Add your convergent roles below, in dependency order.
+    # -------------------------------------------------------------------------
+    # - role: example_convergent
+    #   tags: [example]
+    #
+    # - role: nginx
+    #   tags: [nginx, webserver]
+    #
+    # - role: my_app
+    #   tags: [app]
+    # -------------------------------------------------------------------------

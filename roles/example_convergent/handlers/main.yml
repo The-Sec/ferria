@@ -1,0 +1,17 @@
+---
+# Handlers for the example_convergent role.
+#
+# htop is a standalone monitoring tool (not a daemon), so no service restart
+# is needed when its configuration changes.
+#
+# For a role that manages a service, add handlers like:
+#
+# - name: Restart myservice
+#   ansible.builtin.systemd:
+#     name: myservice
+#     state: restarted
+#
+# - name: Reload nginx
+#   ansible.builtin.systemd:
+#     name: nginx
+#     state: reloaded

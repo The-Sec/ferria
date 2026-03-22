@@ -1,0 +1,10 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart ferria timer
+  ansible.builtin.systemd:
+    name: ferria-agent.timer
+    state: restarted
+    enabled: true

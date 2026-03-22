@@ -1,0 +1,85 @@
+---
+# =============================================================================
+# Convergent role example: ensure htop is installed and configured
+# =============================================================================
+#
+# This role demonstrates the Ferria convergent pattern.
+#
+# Philosophy: check end-state first, work backwards through the dependency tree.
+#
+#   Desired end-state: htop is installed and /etc/htop/htoprc is present
+#         │
+#         ▼
+#   Are dependencies present? → No → Install them
+#         │ Yes
+#         ▼
+#   Is htop installed? → No → Install htop
+#         │ Yes
+#         ▼
+#   Is config directory present? → No → Create it
+#         │ Yes
+#         ▼
+#   Does config file match template? → No → Redeploy it
+#         │ Yes
+#         ▼
+#   Is htop functional? → Verify (never changes state)
+#
+# Ansible's built-in modules are idempotent — package, template, file, and
+# service modules all check current state before acting. This role's
+# "convergent" aspect is structural: tasks are ordered by dependency layer
+# and each one documents what it is checking.
+# =============================================================================
+
+# --- Layer 1: Dependencies ---
+# Install prerequisite packages before the main package.
+# If empty (the default), this task is skipped.
+- name: Ensure base dependencies are present
+  ansible.builtin.package:
+    name: "{{ example_dependencies }}"
+    state: present
+  when: example_dependencies | length > 0
+  tags: [example]
+
+# --- Layer 2: Package installation ---
+# Desired end-state: htop binary is present and executable.
+# ansible.builtin.package is idempotent — if htop is already installed
+# at the requested state, this task reports OK without doing anything.
+- name: Ensure htop is installed
+  ansible.builtin.package:
+    name: htop
+    state: present
+  tags: [example]
+
+# --- Layer 3: Configuration ---
+# Desired end-state: /etc/htop/ exists and /etc/htop/htoprc matches the template.
+# ansible.builtin.file checks the directory's current state before acting.
+# ansible.builtin.template computes a checksum of the rendered template and
+# compares it to the existing file — no rewrite if content already matches.
+- name: Ensure htop configuration directory exists
+  ansible.builtin.file:
+    path: /etc/htop
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: [example]
+
+- name: Deploy htop configuration from template
+  ansible.builtin.template:
+    src: example.conf.j2
+    dest: /etc/htop/htoprc
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [example]
+
+# --- Layer 4: Verification ---
+# Confirm the end-state is actually satisfied by checking htop runs.
+# changed_when: false ensures this task never reports a change —
+# it is purely a read-only verification step.
+- name: Verify htop is functional
+  ansible.builtin.command: htop --version
+  register: htop_check
+  changed_when: false
+  failed_when: htop_check.rc != 0
+  tags: [example]

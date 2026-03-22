@@ -1,0 +1,29 @@
+# Ferria SOPS configuration
+# Add your age public keys below. Each machine should have its own key.
+#
+# Generate a key pair on each machine:
+#   age-keygen -o /etc/ferria/age-key.txt
+#
+# Display the public key:
+#   age-keygen -y /etc/ferria/age-key.txt
+#   # Outputs: age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#
+# Add the public key string to the appropriate rule below, then
+# run `sops updatekeys <file>` to re-encrypt any existing secret files.
+
+creation_rules:
+  # Encrypt files in group_vars/ with ALL machine keys (all machines can decrypt).
+  # Replace the placeholder with your actual age public keys.
+  - path_regex: group_vars/.*\.sops\.yml$
+    age: >-
+      age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+  # Encrypt host-specific secret files with only the relevant machine's key.
+  - path_regex: host_vars/.*\.sops\.yml$
+    age: >-
+      age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+  # Catch-all for any other .sops.yml files in the repo root.
+  - path_regex: .*\.sops\.yml$
+    age: >-
+      age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

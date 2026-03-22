@@ -1,0 +1,19 @@
+---
+# Default variables for the example_convergent role.
+# This role demonstrates the Ferria convergent pattern using htop.
+#
+# Override in group_vars/<group>.yml or host_vars/<hostname>.yml:
+#   example_htop_config:
+#     delay: 10
+#     color_scheme: 5
+
+# Optional prerequisite packages to install before htop.
+example_dependencies: []
+
+# htop display settings written to /etc/htop/htoprc via template.
+example_htop_config:
+  delay: 15             # Update delay in tenths of a second (15 = 1.5s)
+  color_scheme: 0       # Color scheme: 0=default, 1-6=various themes
+  highlight_base_name: 1
+  highlight_megabytes: 1
+  highlight_threads: 0
