@@ -1,0 +1,10 @@
+[Unit]
+Description=GitOps Agent
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gitops-lab/clusters/swh41/bootstrap/ansible/scripts/sync-and-apply.sh
+Environment=SOPS_AGE_KEY_FILE=/etc/gitops-lab/age.key
+StandardOutput=append:/var/log/gitops-agent.log
+StandardError=append:/var/log/gitops-agent.log

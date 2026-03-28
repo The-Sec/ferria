@@ -1,0 +1,16 @@
+---
+# - name: Update and upgrade apt packages
+#   ansible.builtin.apt:
+#     upgrade: yes
+#     update_cache: yes
+#     cache_valid_time: 86400 #One day
+#   tags: bootstrap
+
+- name: Install required packages
+  ansible.builtin.apt:
+    name:
+      - ansible=7.7.0+dfsg-3+deb12u1
+      - git=1:2.39.5-0+deb12u2
+    state: present
+    update_cache: true
+  tags: bootstrap

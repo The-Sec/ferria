@@ -1,0 +1,9 @@
+---
+- name: Set the timezone for the server to be Europe/Amsterdam
+  ansible.builtin.file:
+    src: /usr/share/zoneinfo/Europe/Amsterdam
+    dest: /etc/localtime
+    state: link
+  notify:
+    - reconfigure timezone
+  tags: timezone

@@ -1,0 +1,35 @@
+- name: Ensure basic build prerequisites and drbd-utils are present
+  ansible.builtin.apt:
+    update_cache: true
+    state: present
+    name:
+    - build-essential
+    - libelf-dev
+    - pkg-config
+    - ca-certificates
+    - curl
+    - drbd-utils
+
+- name: Ensure Armbian kernel headers meta-package is installed (ODROID XU4/HC2)
+  ansible.builtin.apt:
+    name: "{{ armbian_headers_pkg }}"
+    state: present
+    register: _headers_pkg
+    failed_when: false
+
+- name: Verify kernel headers exist for the running kernel
+  ansible.builtin.stat:
+    path: "/lib/modules/{{ ansible_kernel }}/build/Makefile"
+    register: drbd_hdr
+
+- name: Detect currently loaded DRBD version (if any)
+  ansible.builtin.command: modinfo -F version drbd
+    register: drbd_modinfo
+    failed_when: false
+    changed_when: false
+
+- name: Set probe facts
+  ansible.builtin.set_fact:
+    drbd_headers_present: "{{ drbd_hdr.stat.exists | bool }}"
+    drbd_loaded_version: "{{ (drbd_modinfo.stdout | trim) if drbd_modinfo.rc == 0 else '0.0.0' }}"
+    drbd_build_needed: "{{ (not drbd_headers_present) or (drbd_modinfo.rc != 0) or ((drbd_modinfo.stdout | trim) is version(drbd_version, '<')) }}"

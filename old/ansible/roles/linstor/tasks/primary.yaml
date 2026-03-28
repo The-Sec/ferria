@@ -1,0 +1,45 @@
+---
+- name: Promote/mount shards where this node is primary
+  when: item.primary == inventory_hostname
+  loop: "{{ linstor_resources }}"
+  loop_control: { loop_var: item }
+  block:
+    - name: Promote shard to Primary (safe if already primary)
+      ansible.builtin.command: "linstor resource promote {{ item.name }} --node {{ inventory_hostname }}"
+      register: prom
+      failed_when: prom.rc not in [0,126,127]
+      changed_when: "'already' not in (prom.stdout | lower + prom.stderr | lower)"
+
+    - name: Ensure mount point exists
+      ansible.builtin.file:
+        path: "{{ item.mount }}"
+        state: directory
+        mode: "0755"
+
+    - name: Probe existing filesystem
+      ansible.builtin.command: "blkid -o value -s TYPE /dev/drbd/by-resource/{{ item.name }}/0"
+      register: fsprobe
+      failed_when: false
+      changed_when: false
+
+    - name: Make filesystem if absent
+      community.general.filesystem:
+        fstype: "{{ linstor.fs_type }}"
+        dev: "/dev/drbd/by-resource/{{ item.name }}/0"
+      when: fsprobe.rc != 0 or (fsprobe.stdout | trim) == ""
+
+    - name: Mount filesystem
+      ansible.builtin.mount:
+        path: "{{ item.mount }}"
+        src: "/dev/drbd/by-resource/{{ item.name }}/0"
+        fstype: "{{ linstor.fs_type }}"
+        opts: "noatime,nodiratime"
+        state: mounted
+
+    - name: Persist mount in fstab
+      ansible.builtin.mount:
+        path: "{{ item.mount }}"
+        src: "/dev/drbd/by-resource/{{ item.name }}/0"
+        fstype: "{{ linstor.fs_type }}"
+        opts: "noatime,nodiratime"
+        state: present

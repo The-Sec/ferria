@@ -82,10 +82,10 @@ Add the public key as a **read-only deploy key** in your repository settings
 ```bash
 # Download and run bootstrap.sh directly:
 curl -fsSL https://raw.githubusercontent.com/yourorg/my-infra/main/bootstrap.sh \
-  | bash -s -- -r git@github.com:yourorg/my-infra.git -b main -i 30
+  | bash -s -- -r git@github.com:yourorg/my-infra.git -b main -i 30 -k accept-new
 
 # Or with a local copy:
-./bootstrap.sh -r git@github.com:yourorg/my-infra.git -b main -i 30
+./bootstrap.sh -r git@github.com:yourorg/my-infra.git -b main -i 30 -k yes
 ```
 
 Ferria is now installed. It will pull and converge every 30 minutes.
@@ -106,6 +106,7 @@ All variables are defined in `group_vars/all.yml`. Override per-group in
 | `ferria_commit_verify` | `false` | Require cryptographically signed commits |
 | `ferria_venv_path` | `/opt/ferria/venv` | Python venv path |
 | `ferria_age_key_path` | `/etc/ferria/age-key.txt` | Path to the age private key for SOPS |
+| `ferria_ssh_strict_host_key_checking` | `accept-new` | SSH host key checking policy used by Git operations |
 | `ferria_log_level` | `info` | Log verbosity |
 | `ferria_only_if_changed` | `true` | Skip playbook run if no new commits |
 | `ferria_clean_checkout` | `true` | Discard local changes before each pull |
@@ -139,7 +140,7 @@ The `scripts/ferria-ctl.sh` script wraps common operations:
 # Trigger an immediate convergence run (outside timer schedule)
 ./scripts/ferria-ctl.sh run
 
-# Dry-run: show what would change without applying
+# Dry-run: show what would change without applying (isolated temp checkout)
 ./scripts/ferria-ctl.sh verify
 
 # Follow logs in real time
@@ -190,6 +191,14 @@ When enabled, Ferria verifies the cryptographic signature of the latest commit
 before applying it. This ensures only commits signed by trusted keys can change
 machine state. Requires commits to be signed with GPG or SSH keys. Disable
 (the default) if your commits are not signed.
+
+### SSH host key checking (`-k` / `ferria_ssh_strict_host_key_checking`)
+
+Controls SSH host-key verification for Git operations:
+
+- `yes`: strict verification; host key must already be trusted
+- `accept-new`: trust first-seen keys, then enforce thereafter
+- `no`: disable host-key checks (not recommended)
 
 ## Architecture
 

@@ -1,0 +1,8 @@
+---
+- name: Create lvmthin storage pool on this node
+  ansible.builtin.command: >-
+    linstor storage-pool create lvmthin {{ ansible_hostname }}
+    {{ linstor.storage_pool_name }} {{ linstor.vg_name }} {{ linstor.thinpool_name }}
+  register: sp
+  failed_when: sp.rc not in [0,126,127]
+  changed_when: "'already' not in (sp.stdout | lower + sp.stderr | lower)"

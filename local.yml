@@ -45,6 +45,15 @@
     - role: ferria_agent
       tags: [ferria, agent]
 
+    - role: hostname
+      tags: [hostname]
+
+    - role: timezone
+      tags: [timezone]
+
+    - role: time_sync
+      tags: [time_sync, ntp, chrony]
+
     # -------------------------------------------------------------------------
     # Add your convergent roles below, in dependency order.
     # -------------------------------------------------------------------------

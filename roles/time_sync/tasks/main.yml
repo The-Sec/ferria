@@ -1,0 +1,34 @@
+---
+# =============================================================================
+# Convergent role: manage time synchronisation with chrony
+# =============================================================================
+
+- name: Ensure time sync package is installed
+  ansible.builtin.package:
+    name: "{{ ferria_time_sync_package }}"
+    state: present
+  tags: [time_sync]
+
+- name: Deploy chrony configuration
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: "{{ ferria_time_sync_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart time sync service
+  tags: [time_sync]
+
+- name: Ensure time sync service is enabled and started
+  ansible.builtin.systemd:
+    name: "{{ ferria_time_sync_service }}"
+    enabled: true
+    state: started
+  tags: [time_sync]
+
+- name: Verify time sync service is active
+  ansible.builtin.command: systemctl is-active "{{ ferria_time_sync_service }}"
+  register: time_sync_status
+  changed_when: false
+  failed_when: (time_sync_status.stdout | trim) != 'active'
+  tags: [time_sync]

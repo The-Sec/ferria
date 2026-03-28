@@ -1,0 +1,14 @@
+# Controller identity: set controller_host to an IP or resolvable name.
+linstor:
+  controller_host: ""          # REQUIRED in group/host vars
+  controller_ip: ""            # optional; used to seed /etc/hosts if controller_host doesn't resolve
+  storage_pool_name: "pool1"   # LINSTOR storage pool name
+  vg_name: "vgdata"
+  thinpool_name: "tpool"
+  fs_type: "xfs"
+
+# Define your shards; share capacity via the same thin-pool
+linstor_resources: []   # e.g. [{name: media, size: 8T, primary: stor1, mount: /srv/media, replicas: 2}, ...]
+
+# Mark exactly one node with linstor_controller: true
+linstor_controller: false

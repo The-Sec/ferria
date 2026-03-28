@@ -1,0 +1,70 @@
+---
+# roles/linstor/tasks/services.yaml
+# Small, idempotent service tweaks for SBCs.
+# - make sure DRBD autoloads
+# - cap Satellite JVM memory via systemd drop-in using JAVA_TOOL_OPTIONS
+
+- name: Load drbd kernel module (best-effort)
+  ansible.builtin.command: modprobe drbd
+  failed_when: false
+  changed_when: false
+  tags: [linstor, linstor.services]
+
+- name: Ensure drbd loads at boot via modules-load.d
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/drbd.conf
+    mode: "0644"
+    content: |
+      drbd
+  tags: [linstor, linstor.services]
+
+# Ensure the base unit exists before writing a drop-in
+- name: Check linstor-satellite unit presence
+  ansible.builtin.stat:
+    path: /etc/systemd/system/linstor-satellite.service
+  register: _sat_unit
+  tags: [linstor, linstor.services]
+
+- name: Fail if linstor-satellite unit is missing
+  ansible.builtin.fail:
+    msg: "linstor-satellite.service not found. Run the install task before services."
+  when: not _sat_unit.stat.exists
+  tags: [linstor, linstor.services]
+
+- name: Create drop-in directory for linstor-satellite
+  ansible.builtin.file:
+    path: /etc/systemd/system/linstor-satellite.service.d
+    state: directory
+    mode: "0755"
+  tags: [linstor, linstor.services]
+
+- name: Cap satellite JVM memory & GC (keep it light on SBCs)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/linstor-satellite.service.d/10-jvm.conf
+    mode: "0644"
+    content: |
+      [Service]
+      # JAVA_TOOL_OPTIONS is picked up by the JVM automatically
+      Environment="JAVA_TOOL_OPTIONS=-Xms128m -Xmx512m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+  register: _jvm_dropin
+  tags: [linstor, linstor.services]
+
+- name: Reload systemd if drop-in changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _jvm_dropin.changed
+  tags: [linstor, linstor.services]
+
+- name: Ensure linstor-satellite is enabled and running
+  ansible.builtin.systemd:
+    name: linstor-satellite
+    enabled: true
+    state: started
+  tags: [linstor, linstor.services]
+
+- name: Restart linstor-satellite if drop-in changed
+  ansible.builtin.systemd:
+    name: linstor-satellite
+    state: restarted
+  when: _jvm_dropin.changed
+  tags: [linstor, linstor.services]

@@ -1,0 +1,41 @@
+---
+# =============================================================================
+# Convergent role: manage system timezone
+# =============================================================================
+
+- name: Ensure requested timezone exists
+  ansible.builtin.stat:
+    path: "/usr/share/zoneinfo/{{ ferria_timezone }}"
+  register: timezone_file
+  tags: [timezone]
+
+- name: Fail when requested timezone is invalid
+  ansible.builtin.fail:
+    msg: "Invalid timezone '{{ ferria_timezone }}'. Zoneinfo file not found."
+  when: not timezone_file.stat.exists
+  tags: [timezone]
+
+- name: Ensure /etc/localtime points to requested timezone
+  ansible.builtin.file:
+    src: "/usr/share/zoneinfo/{{ ferria_timezone }}"
+    dest: /etc/localtime
+    state: link
+    force: true
+  tags: [timezone]
+
+- name: Persist timezone in /etc/timezone when present
+  ansible.builtin.copy:
+    content: "{{ ferria_timezone }}\n"
+    dest: /etc/timezone
+    owner: root
+    group: root
+    mode: "0644"
+  when: ansible_facts['os_family'] == 'Debian'
+  tags: [timezone]
+
+- name: Verify timezone setting
+  ansible.builtin.command: timedatectl show -p Timezone --value
+  register: timezone_check
+  changed_when: false
+  failed_when: (timezone_check.stdout | trim) != ferria_timezone
+  tags: [timezone]

@@ -1,0 +1,9 @@
+all:
+  children:
+    storage:
+      hosts:
+        brk01:
+          ansible_connection: local
+        brk02:
+          ansible_connection: local
+          linstor_controller: true

@@ -1,0 +1,21 @@
+---
+- name: Ensure resource & volume definitions exist
+  ansible.builtin.command: "linstor resource-definition create {{ item.name }}"
+  loop: "{{ linstor_resources }}"
+  register: rd
+  failed_when: rd.rc not in [0,126,127]
+  changed_when: "'already' not in (rd.stdout | lower + rd.stderr | lower)"
+
+- name: Ensure volume definitions exist
+  ansible.builtin.command: "linstor volume-definition create {{ item.name }} {{ item.size }}"
+  loop: "{{ linstor_resources }}"
+  register: vd
+  failed_when: vd.rc not in [0,126,127]
+  changed_when: "'already' not in (vd.stdout | lower + vd.stderr | lower)"
+
+- name: Place resources with requested replicas
+  ansible.builtin.command: "linstor resource create --auto-place {{ item.replicas | default(2) }} {{ item.name }}"
+  loop: "{{ linstor_resources }}"
+  register: plc
+  failed_when: plc.rc not in [0,126,127]
+  changed_when: "'already' not in (plc.stdout | lower + plc.stderr | lower)"

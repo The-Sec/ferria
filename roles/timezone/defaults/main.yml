@@ -1,0 +1,4 @@
+---
+# Default variables for the timezone role.
+
+ferria_timezone: "UTC"

@@ -1,0 +1,518 @@
+---
+# roles/linstor/tasks/install.yaml - Unified LINSTOR Installation
+# Installs LINSTOR Controller and/or Satellite based on configuration variables
+#
+# Required variables (in defaults/main.yaml):
+#   linstor.controller_host: Controller hostname/IP
+#   linstor_controller: false  # Set to true on controller node
+# Optional variables:
+#   linstor.controller_ip: ""     # Optional IP for /etc/hosts
+#   linstor_controller_jar_url: ""     # Optional prebuilt controller JAR
+#   linstor_satellite_jar_url: ""      # Optional prebuilt satellite JAR
+#   linstor_use_thin_provisioning: false
+#   linstor_skip_drbd_guard: false
+
+# ─────────────────────────── Variable validation and setup ───────────────────────────
+- name: Set installation flags based on configuration
+  ansible.builtin.set_fact:
+    _install_controller: "{{ linstor_controller | default(false) }}"
+    _install_satellite: "{{ not (linstor_controller | default(false)) or linstor_install_satellite | default(true) }}"
+    _controller_host: "{{ linstor.controller_host | default('') }}"
+    _controller_ip: "{{ linstor.controller_ip | default('') }}"
+  tags: [linstor, linstor.config]
+
+# ─────────────────────────── Controller connectivity validation (for satellites) ───────────────────────────
+- name: Assert controller_host provided for satellite installation
+  ansible.builtin.assert:
+    that: "_controller_host | length > 0"
+    fail_msg: "Set linstor.controller_host (IP or resolvable DNS name). Optionally linstor.controller_ip."
+  when: _install_satellite
+  tags: [linstor, linstor.config]
+
+- name: Try resolve controller_host
+  ansible.builtin.command: "getent hosts {{ _controller_host }}"
+  register: _getent1
+  changed_when: false
+  failed_when: false
+  when: _install_satellite
+  tags: [linstor, linstor.config]
+
+- name: Seed /etc/hosts if unresolved and controller_ip given
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ _controller_ip }} {{ _controller_host }}"
+    state: present
+    create: true
+  when: 
+    - _install_satellite
+    - _getent1.rc != 0 
+    - _controller_ip | length > 0
+  tags: [linstor, linstor.config]
+
+- name: Re-check resolution
+  ansible.builtin.command: "getent hosts {{ _controller_host }}"
+  register: _getent2
+  changed_when: false
+  failed_when: false
+  when: _install_satellite
+  tags: [linstor, linstor.config]
+
+- name: Fail if controller_host still unresolved
+  ansible.builtin.fail:
+    msg: "controller_host '{{ _controller_host }}' does not resolve. Use an IP or provide linstor.controller_ip to add /etc/hosts."
+  when: 
+    - _install_satellite
+    - _getent2.rc != 0
+  tags: [linstor, linstor.config]
+
+# ─────────────────────────── Essential packages (shared) ───────────────────────────
+- name: Install essential LINSTOR packages
+  ansible.builtin.apt:
+    update_cache: true
+    state: present
+    name:
+      - ca-certificates
+      - curl
+      - openjdk-17-jdk        # Java runtime - essential for both
+      - unzip                 # For JAR verification
+      # Satellite-specific packages
+      - "{{ 'lvm2' if _install_satellite else omit }}"
+      # Controller and source build packages
+      - "{{ 'git' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+      - "{{ 'gradle' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+      - "{{ 'protobuf-compiler' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+      - "{{ 'build-essential' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+  tags: [linstor, linstor.install]
+
+- name: Install thin provisioning tools (satellite only, if enabled)
+  ansible.builtin.apt:
+    name: thin-provisioning-tools
+    state: present
+  when: 
+    - _install_satellite
+    - linstor_use_thin_provisioning | default(false)
+  tags: [linstor, linstor.install]
+
+# ─────────────────────────── DRBD check (satellite only) ─────────────────────────
+- name: Check DRBD availability (satellite only, if not skipped)
+  when: 
+    - _install_satellite
+    - not (linstor_skip_drbd_guard | default(false))
+  block:
+    - name: Load DRBD module
+      ansible.builtin.command: modprobe drbd
+      failed_when: false
+      changed_when: false
+      
+    - name: Verify DRBD version
+      ansible.builtin.shell: |
+        if ! modinfo drbd &>/dev/null; then
+          echo "DRBD module not available"
+          exit 1
+        fi
+        version=$(modinfo -F version drbd 2>/dev/null || echo "0.0")
+        if [[ ! "$version" =~ ^9\. ]]; then
+          echo "DRBD version $version is not >= 9.0"
+          exit 1
+        fi
+      args: { executable: /bin/bash }
+      register: _drbd_check
+      failed_when: _drbd_check.rc != 0
+  tags: [linstor, linstor.install]
+
+# ───────────────────── User and directories ─────────────────────
+- name: Setup LINSTOR user and directories
+  block:
+    - ansible.builtin.user:
+        name: linstor
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        
+    - ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "/opt/linstor", owner: "root", group: "root", mode: "0755" }
+        - { path: "/var/lib/linstor", owner: "linstor", group: "linstor", mode: "0755" }
+        - { path: "/var/log/linstor", owner: "linstor", group: "linstor", mode: "0755" }
+        - { path: "/etc/linstor", owner: "root", group: "root", mode: "0755" }
+  tags: [linstor, linstor.install]
+
+# ─────────────────────────── Shared configuration ─────────────────────────
+- name: Create LINSTOR environment file
+  ansible.builtin.copy:
+    dest: "/etc/linstor/linstor-{{ item }}.env"
+    mode: "0644"
+    content: |
+      # Java runtime options for LINSTOR {{ item | title }}
+      # Used by both systemd service and launcher script
+      LINSTOR_JAVA_OPTS=-Xms128m -Xmx{{ '1024m' if item == 'controller' else '512m' }} -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Dfile.encoding=UTF-8
+  loop:
+    - "{{ 'controller' if _install_controller else omit }}"
+    - "{{ 'satellite' if _install_satellite else omit }}"
+  when: item != omit
+  tags: [linstor, linstor.install]
+
+- name: Write linstor-client.conf (satellite only)
+  ansible.builtin.copy:
+    dest: /etc/linstor/linstor-client.conf
+    mode: '0644'
+    content: |
+      [global]
+      controllers = {{ _controller_host }}:{{ linstor_controller_port | default('3370') }}
+  when: _install_satellite
+  notify: Restart LINSTOR satellite
+  tags: [linstor, linstor.config]
+
+# ───────────────────────── Installation from prebuilt JARs ─────────────────────────
+- name: Install controller from prebuilt JAR
+  when: 
+    - _install_controller
+    - linstor_controller_jar_url is defined
+  block:
+    - ansible.builtin.get_url:
+        url: "{{ linstor_controller_jar_url }}"
+        dest: "/opt/linstor/linstor-controller.jar"
+        mode: "0644"
+        timeout: 60
+        
+    - ansible.builtin.set_fact:
+        _linstor_controller_use_jar: true
+  tags: [linstor, linstor.install]
+
+- name: Install satellite from prebuilt JAR
+  when: 
+    - _install_satellite
+    - linstor_satellite_jar_url is defined
+  block:
+    - ansible.builtin.get_url:
+        url: "{{ linstor_satellite_jar_url }}"
+        dest: "/opt/linstor/linstor-satellite.jar"
+        mode: "0644"
+        timeout: 60
+        
+    - ansible.builtin.set_fact:
+        _linstor_satellite_use_jar: true
+  tags: [linstor, linstor.install]
+
+# ───────────────────────── Build from source (shared logic) ─────────────────────────
+- name: Build LINSTOR from source (when JARs not provided)
+  when: >
+    (_install_controller and linstor_controller_jar_url is not defined) or
+    (_install_satellite and linstor_satellite_jar_url is not defined)
+  block:
+    - name: Set build variables
+      ansible.builtin.set_fact:
+        _linstor_repo: "{{ linstor_repo | default('https://github.com/LINBIT/linstor-server.git') }}"
+        _linstor_tag: "{{ linstor_server_tag | default('v' ~ (linstor_server_version | default('1.31.3'))) }}"
+        linstor_src_dir: "/opt/linstor/linstor-server"
+        
+    - name: Clone LINSTOR source
+      ansible.builtin.git:
+        repo: "{{ _linstor_repo }}"
+        dest: "{{ linstor_src_dir }}"
+        version: "{{ _linstor_tag }}"
+        recursive: true
+        update: true
+        depth: 1
+        force: true
+
+    # Fix protoc for ARM builds (controller specific)
+    - name: Setup protoc for ARM builds (controller)
+      when: _install_controller and linstor_controller_jar_url is not defined
+      block:
+        - ansible.builtin.command: bash -lc "command -v protoc || true"
+          register: _protoc
+          changed_when: false
+          
+        - ansible.builtin.fail:
+            msg: "protobuf-compiler (protoc) not found in PATH. Install it first."
+          when: (_protoc.stdout | trim) == ''
+          
+        - ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ linstor_src_dir }}/tools/protoc"
+            - "{{ linstor_src_dir }}/tools/protoc/bin"
+            
+        - ansible.builtin.file:
+            src: "{{ _protoc.stdout | trim }}"
+            dest: "{{ linstor_src_dir }}/tools/protoc/bin/protoc"
+            state: link
+            force: true
+            
+        - name: Find protoc directories and fix them
+          ansible.builtin.find:
+            paths: "{{ linstor_src_dir }}/tools"
+            patterns: "protoc-*"
+            file_type: directory
+          register: _protoc_dirs
+          
+        - ansible.builtin.file:
+            path: "{{ item.path }}/bin"
+            state: directory
+            mode: "0755"
+          loop: "{{ _protoc_dirs.files | default([]) }}"
+          
+        - ansible.builtin.file:
+            path: "{{ item.path }}/bin/protoc"
+            state: absent
+          ignore_errors: true
+          loop: "{{ _protoc_dirs.files | default([]) }}"
+          
+        - ansible.builtin.file:
+            src: "{{ _protoc.stdout | trim }}"
+            dest: "{{ item.path }}/bin/protoc"
+            state: link
+            force: true
+          loop: "{{ _protoc_dirs.files | default([]) }}"
+
+    - name: Build LINSTOR components
+      ansible.builtin.command:
+        cmd: >-
+          ./gradlew 
+          {{ ':controller:assemble -x getProtoc' if _install_controller and linstor_controller_jar_url is not defined else '' }}
+          {{ ':satellite:assemble' if _install_satellite and linstor_satellite_jar_url is not defined else '' }}
+          --no-daemon
+        chdir: "{{ linstor_src_dir }}"
+      environment:
+        GRADLE_OPTS: "-Xmx1024m"
+        JAVA_HOME: "{{ '/usr/lib/jvm/java-17-openjdk-armhf' if ansible_architecture == 'armv7l' else '/usr/lib/jvm/java-17-openjdk-amd64' }}"
+        PATH: "{{ linstor_src_dir }}/tools/protoc/bin:{{ ansible_env.PATH }}"
+        PROTOC: "{{ _protoc.stdout | default('protoc') | trim }}"
+      async: 1800
+      poll: 30
+
+    # Find built components
+    - name: Find built controller JAR
+      when: _install_controller and linstor_controller_jar_url is not defined
+      block:
+        - ansible.builtin.find:
+            paths:
+              - "{{ linstor_src_dir }}/controller/build/libs"
+              - "{{ linstor_src_dir }}/controller/build/install/controller/lib"
+            patterns:
+              - "linstor-controller*.jar"
+              - "controller*.jar"
+            recurse: true
+            file_type: file
+          register: _controller_jar_files
+          
+        - ansible.builtin.set_fact:
+            _controller_jar: "{{ (_controller_jar_files.files | sort(attribute='mtime', reverse=true))[0].path if (_controller_jar_files.matched | default(0) | int) > 0 else '' }}"
+            
+        - ansible.builtin.fail:
+            msg: "Controller jar not found in {{ linstor_src_dir }}/controller/build. Check Gradle output."
+          when: _controller_jar == ''
+
+    - name: Find built satellite JARs and create launcher
+      when: _install_satellite and linstor_satellite_jar_url is not defined
+      block:
+        - ansible.builtin.shell: |
+            cd "{{ linstor_src_dir }}"
+            find . -path '*/build/libs/*.jar' -not -name '*-sources.jar' -not -name '*-javadoc.jar' -printf '%p:' | sed 's/:$//'
+          register: _classpath
+          
+        - ansible.builtin.shell: |
+            cd "{{ linstor_src_dir }}/satellite/src/main/java"
+            file=$(find . -name '*.java' -exec grep -l 'public static void main' {} \; | head -1)
+            pkg=$(grep '^package ' "$file" | sed 's/package \([^;]*\);.*/\1/')
+            cls=$(basename "$file" .java)
+            echo "$pkg.$cls"
+          register: _main_class
+          
+        - name: Create launcher script for satellite source build
+          ansible.builtin.copy:
+            dest: "/opt/linstor/run-satellite.sh"
+            mode: "0755"
+            content: |
+              #!/bin/bash
+              set -euo pipefail
+              
+              # Source the same environment file that systemd uses
+              if [ -f /etc/linstor/linstor-satellite.env ]; then
+                source /etc/linstor/linstor-satellite.env
+              else
+                echo "Warning: /etc/linstor/linstor-satellite.env not found, using defaults"
+                LINSTOR_JAVA_OPTS="-Xms128m -Xmx512m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Dfile.encoding=UTF-8"
+              fi
+              
+              cd "{{ linstor_src_dir }}"
+              exec java ${LINSTOR_JAVA_OPTS} \
+                -cp "{{ _classpath.stdout }}" \
+                "{{ _main_class.stdout }}" \
+                --config-directory /etc/linstor "$@"
+                
+        - ansible.builtin.set_fact:
+            _linstor_satellite_use_jar: false
+            
+    - name: Set facts for source builds
+      ansible.builtin.set_fact:
+        _linstor_controller_use_jar: "{{ linstor_controller_jar_url is defined }}"
+        _linstor_satellite_use_jar: "{{ linstor_satellite_jar_url is defined }}"
+  tags: [linstor, linstor.install, linstor.build]
+
+# ───────────────────── Systemd services ─────────────────────
+- name: Install systemd service for controller
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/linstor-controller.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=LINSTOR Controller
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      User=root
+      Group=root
+      EnvironmentFile=/etc/linstor/linstor-controller.env
+      {% if _linstor_controller_use_jar | default(false) %}
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -jar /opt/linstor/linstor-controller.jar --config-directory /etc/linstor
+      {% else %}
+      WorkingDirectory={{ linstor_src_dir }}
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -jar {{ _controller_jar }} --config-directory /etc/linstor
+      {% endif %}
+      Restart=on-failure
+      RestartSec=10s
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  register: _controller_systemd_unit
+  when: _install_controller
+  tags: [linstor, linstor.install]
+
+- name: Install systemd service for satellite
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/linstor-satellite.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=LINSTOR Satellite
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=root
+      Group=root
+      EnvironmentFile=/etc/linstor/linstor-satellite.env
+      {% if _linstor_satellite_use_jar | default(false) %}
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -jar /opt/linstor/linstor-satellite.jar --config-directory /etc/linstor
+      {% else %}
+      WorkingDirectory={{ linstor_src_dir }}
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -cp "{{ _classpath.stdout }}" "{{ _main_class.stdout }}" --config-directory /etc/linstor
+      {% endif %}
+      Restart=on-failure
+      RestartSec=10s
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  register: _satellite_systemd_unit
+  when: _install_satellite
+  tags: [linstor, linstor.install]
+
+- name: Reload systemd and start services
+  block:
+    - ansible.builtin.systemd:
+        daemon_reload: true
+      when: (_controller_systemd_unit.changed | default(false)) or (_satellite_systemd_unit.changed | default(false))
+      
+    - ansible.builtin.systemd:
+        name: linstor-controller
+        enabled: true
+        state: started
+      when: _install_controller
+      
+    - ansible.builtin.systemd:
+        name: linstor-satellite
+        enabled: true
+        state: started
+      when: _install_satellite
+  tags: [linstor, linstor.install]
+
+# ───────────────────── Node Registration with Controller (satellite only) ─────────────────────
+- name: Install CLI and register satellite with controller
+  when: _install_satellite
+  block:
+    - name: Ensure CLI runtime dependencies for node registration
+      ansible.builtin.apt:
+        state: present
+        name:
+          - python3-pip
+
+    - name: Try install linstor CLI (linstor-client)
+      ansible.builtin.pip:
+        name: linstor-client
+        state: present
+      register: _pip_cli1
+      failed_when: false
+
+    - name: Fallback install linstor (alternate package name)
+      ansible.builtin.pip:
+        name: linstor
+        state: present
+      when: (_pip_cli1 is failed) or (_pip_cli1.failed | default(false))
+
+    - name: Check for linstor CLI in PATH
+      ansible.builtin.command: bash -lc "command -v linstor || true"
+      register: _linstor_cli
+      changed_when: false
+
+    - name: Fail if linstor CLI not found
+      ansible.builtin.fail:
+        msg: "linstor CLI not found after pip install. Ensure pip bin dir is in PATH (e.g., /usr/local/bin)."
+      when: (_linstor_cli.stdout | trim) == ''
+
+    - name: Determine this node's IP address and name
+      ansible.builtin.set_fact:
+        _node_ip: "{{ (hostvars[inventory_hostname].ansible_default_ipv4.address | default(ansible_all_ipv4_addresses[0])) }}"
+        _node_name: "{{ inventory_hostname }}"
+
+    - name: Set controller endpoint for registration
+      ansible.builtin.set_fact:
+        _controllers: "{{ _controller_host }}:{{ linstor_controller_port | default(3370) }}"
+
+    - name: Wait for LINSTOR Satellite service to be ready
+      ansible.builtin.wait_for:
+        port: 3366
+        host: "{{ _node_ip }}"
+        timeout: 60
+        delay: 5
+
+    - name: Register node with controller (idempotent)
+      ansible.builtin.command: >-
+        linstor --controllers {{ _controllers }} node create {{ _node_name }} {{ _node_ip }}
+      register: _node_create
+      failed_when: _node_create.rc != 0 and ('already exists' not in (_node_create.stdout ~ _node_create.stderr))
+      changed_when: _node_create.rc == 0
+      environment:
+        PATH: "/usr/local/bin:{{ ansible_env.PATH }}"
+
+    - name: Show registration output
+      ansible.builtin.debug:
+        var: _node_create.stdout_lines
+      when: _node_create.stdout_lines is defined
+
+    - name: Verify node registration
+      ansible.builtin.command: >-
+        linstor --controllers {{ _controllers }} node list
+      register: _node_list
+      changed_when: false
+      failed_when: _node_name not in _node_list.stdout
+      environment:
+        PATH: "/usr/local/bin:{{ ansible_env.PATH }}"
+
+    - name: Display registration success
+      ansible.builtin.debug:
+        msg: "Node {{ _node_name }} successfully registered with LINSTOR controller at {{ _controllers }}"
+  tags: [linstor, linstor.register]

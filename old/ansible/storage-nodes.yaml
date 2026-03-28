@@ -1,0 +1,12 @@
+---
+- name: Apply Gitops configuration
+  hosts: storage
+  become: true
+  roles:
+    - role: prerequierments
+    - role: gitops-agent
+    - role: timezone
+    - role: ntp
+    - role: disk
+    - role: drbd
+    - role: linstor

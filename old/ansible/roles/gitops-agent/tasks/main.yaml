@@ -1,0 +1,27 @@
+---
+- name: Deploy systemd service
+  ansible.builtin.copy:
+    src: gitops-agent.service
+    dest: /etc/systemd/system/gitops-agent.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+  tags: systemd
+
+- name: Deploy systemd timer
+  ansible.builtin.copy:
+    src: gitops-agent.timer
+    dest: /etc/systemd/system/gitops-agent.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+  tags: systemd
+
+- name: Enable and start gitops-agent.timer
+  ansible.builtin.systemd_service:
+    name: gitops-agent.timer
+    enabled: true
+    state: started
+  tags: systemd

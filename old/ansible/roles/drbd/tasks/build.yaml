@@ -1,0 +1,39 @@
+- name: Fail fast if headers are missing (required to build DRBD)
+  ansible.builtin.fail:
+    msg: >-
+    Kernel headers for {{ ansible_kernel }} not found at /lib/modules/{{ ansible_kernel }}/build/Makefile.\n
+    Install {{ armbian_headers_pkg }} or correct headers for this kernel.
+  when: not drbd_headers_present
+
+
+- name: Download DRBD source tarball (official release)
+  ansible.builtin.get_url:
+    url: "{{ drbd_tar_url }}"
+    dest: "/usr/src/drbd-{{ drbd_version }}.tar.gz"
+    mode: "0644"
+
+
+- name: Unpack DRBD source
+  ansible.builtin.unarchive:
+    src: "/usr/src/drbd-{{ drbd_version }}.tar.gz"
+    dest: "/usr/src"
+    remote_src: true
+    creates: "/usr/src/drbd-{{ drbd_version }}"
+
+
+- name: Build DRBD kernel module (current kernel)
+  ansible.builtin.command: make KDIR=/lib/modules/{{ ansible_kernel }}/build
+  args:
+    chdir: "/usr/src/drbd-{{ drbd_version }}"
+
+
+- name: Install DRBD kernel module (creates-guarded)
+  ansible.builtin.command: make install
+  args:
+    chdir: "/usr/src/drbd-{{ drbd_version }}"
+  creates: "{{ drbd_module_path }}"
+
+
+- name: Refresh module deps
+  ansible.builtin.command: depmod -a
+  changed_when: false

@@ -1,0 +1,9 @@
+---
+# Force Talos to install on SD cards(transport: mmc)
+# as per https://www.talos.dev/v1.9/introduction/system-requirements/#storage
+machine:
+  install:
+    disk: none
+    diskSelector:
+      type: "sd"
+    wipe: false

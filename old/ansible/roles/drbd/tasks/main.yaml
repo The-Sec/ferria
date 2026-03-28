@@ -1,0 +1,109 @@
+---
+# roles/drbd/tasks/main.yaml
+# Build & install DRBD 9 from official tarball on Armbian (armhf)
+# Minimal, deterministic, no DKMS. Requires matching kernel headers.
+# Vars (override as needed):
+#   drbd_version: "9.2.14"
+#   drbd_tar_url: "https://pkg.linbit.com/downloads/drbd/9/drbd-{{ drbd_version }}.tar.gz"
+
+- name: Ensure build prerequisites and drbd-utils are present
+  ansible.builtin.apt:
+    update_cache: true
+    state: present
+    name:
+      - build-essential
+      - libelf-dev
+      - pkg-config
+      - ca-certificates
+      - curl
+      - drbd-utils
+  tags: [drbd, drbd.install]
+
+- name: Verify kernel headers exist for the running kernel
+  ansible.builtin.stat:
+    path: "/lib/modules/{{ ansible_kernel }}/build/Makefile"
+  register: _hdr
+  tags: [drbd, drbd.install]
+
+- name: Fail if headers are missing (required to build DRBD)
+  ansible.builtin.fail:
+    msg: >-
+      Kernel headers for {{ ansible_kernel }} not found at /lib/modules/{{ ansible_kernel }}/build/Makefile.\n
+      Install the matching Armbian headers (e.g. linux-headers-current-odroidxu4) so we can compile DRBD 9.
+  when: not _hdr.stat.exists
+  tags: [drbd, drbd.install]
+
+- name: Read currently loaded DRBD version (if any)
+  ansible.builtin.command: modinfo -F version drbd
+  register: _drbd_ver
+  failed_when: false
+  changed_when: false
+  tags: [drbd, drbd.install]
+
+- name: Compute DRBD version (safe default)
+  ansible.builtin.set_fact:
+    _drbd_vernum: "{{ drbd_version | default('9.2.14') }}"
+  tags: [drbd, drbd.install]
+
+- name: Finalize DRBD version, URL, and build decision
+  ansible.builtin.set_fact:
+    drbd_version: "{{ _drbd_vernum }}"
+    drbd_tar_url: "{{ drbd_tar_url | default('https://pkg.linbit.com/downloads/drbd/9/drbd-' ~ _drbd_vernum ~ '.tar.gz') }}"
+    _build_needed: "{{ _drbd_ver.rc != 0 or (_drbd_ver.stdout | trim) is version(_drbd_vernum, '<') }}"
+  tags: [drbd, drbd.install]
+
+- name: Download DRBD source tarball (official release)
+  ansible.builtin.get_url:
+    url: "{{ drbd_tar_url }}"
+    dest: "/usr/src/drbd-{{ drbd_version }}.tar.gz"
+    mode: "0644"
+  when: _build_needed | bool
+  tags: [drbd, drbd.install]
+
+- name: Unpack DRBD source
+  ansible.builtin.unarchive:
+    src: "/usr/src/drbd-{{ drbd_version }}.tar.gz"
+    dest: "/usr/src"
+    remote_src: true
+    creates: "/usr/src/drbd-{{ drbd_version }}"
+  when: _build_needed | bool
+  tags: [drbd, drbd.install]
+
+- name: Build DRBD kernel module
+  ansible.builtin.command: make KDIR=/lib/modules/{{ ansible_kernel }}/build
+  args:
+    chdir: "/usr/src/drbd-{{ drbd_version }}"
+  when: _build_needed | bool
+  tags: [drbd, drbd.install]
+
+- name: Install DRBD kernel module
+  ansible.builtin.command: make install
+  args:
+    chdir: "/usr/src/drbd-{{ drbd_version }}"
+  when: _build_needed | bool
+  tags: [drbd, drbd.install]
+
+- name: Refresh module deps
+  ansible.builtin.command: depmod -a
+  when: _build_needed | bool
+  changed_when: false
+  tags: [drbd, drbd.install]
+
+- name: Load DRBD module (prefer our installed module)
+  ansible.builtin.shell: |
+    modprobe -r drbd 2>/dev/null || true
+    modprobe drbd
+  changed_when: false
+  tags: [drbd, drbd.install]
+
+- name: Verify DRBD >= 9 is loaded
+  ansible.builtin.command: modinfo -F version drbd
+  register: _drbd_final
+  changed_when: false
+  tags: [drbd, drbd.install]
+
+- name: Fail if DRBD < 9 (LINSTOR requires DRBD9)
+  ansible.builtin.fail:
+    msg: "DRBD {{ _drbd_final.stdout | trim }} loaded, need >= 9."
+  when: (_drbd_final.stdout | trim) is version('9.0', '<')
+  tags: [drbd, drbd.install]

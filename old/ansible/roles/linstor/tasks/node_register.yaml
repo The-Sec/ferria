@@ -1,0 +1,71 @@
+---
+# roles/linstor/tasks/node_register.yaml
+# Register this node with the LINSTOR Controller.
+# Installs a CLI if missing (via pip), then runs `linstor node create` idempotently.
+#
+# Vars you can override:
+#   linstor_controller_host: "localhost"
+#   linstor_controller_port: 3370
+
+- name: Ensure CLI runtime deps
+  ansible.builtin.apt:
+    update_cache: true
+    state: present
+    name:
+      - python3-pip
+  tags: [linstor, linstor.register]
+
+- name: Try install linstor CLI (linstor-client)
+  ansible.builtin.pip:
+    name: linstor-client
+    state: present
+  register: _pip_cli1
+  failed_when: false
+  tags: [linstor, linstor.register]
+
+- name: Fallback install linstor (alternate package name)
+  ansible.builtin.pip:
+    name: linstor
+    state: present
+  when: (_pip_cli1 is failed) or (_pip_cli1.failed | default(false))
+  tags: [linstor, linstor.register]
+
+- name: Check for linstor CLI in PATH
+  ansible.builtin.command: bash -lc "command -v linstor || true"
+  register: _linstor_cli
+  changed_when: false
+  tags: [linstor, linstor.register]
+
+- name: Fail if linstor CLI not found
+  ansible.builtin.fail:
+    msg: "linstor CLI not found after pip install. Ensure pip bin dir is in PATH (e.g., /usr/local/bin)."
+  when: (_linstor_cli.stdout | trim) == ''
+  tags: [linstor, linstor.register]
+
+- name: Determine this node's IP address
+  ansible.builtin.set_fact:
+    _node_ip: "{{ (hostvars[inventory_hostname].ansible_default_ipv4.address | default(ansible_all_ipv4_addresses[0])) }}"
+    _node_name: "{{ inventory_hostname }}"
+  tags: [linstor, linstor.register]
+
+- name: Set controller endpoint
+  ansible.builtin.set_fact:
+    _ctrl_host: "{{ linstor_controller_host | default('localhost') }}"
+    _ctrl_port: "{{ linstor_controller_port | default(3370) }}"
+    _controllers: "{{ (linstor_controller_host | default('localhost')) ~ ':' ~ (linstor_controller_port | default(3370)) }}"
+  tags: [linstor, linstor.register]
+
+- name: Register node with controller (idempotent)
+  ansible.builtin.command: >-
+    linstor --controllers {{ _controllers }} node create {{ _node_name }} {{ _node_ip }}
+  register: _node_create
+  failed_when: _node_create.rc != 0 and ('already exists' not in (_node_create.stdout ~ _node_create.stderr))
+  changed_when: _node_create.rc == 0
+  environment:
+    PATH: "/usr/local/bin:{{ ansible_env.PATH }}"
+  tags: [linstor, linstor.register]
+
+- name: Show registration output
+  ansible.builtin.debug:
+    var: _node_create.stdout
+  tags: [linstor, linstor.register]

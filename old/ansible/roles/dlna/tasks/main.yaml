@@ -1,0 +1,14 @@
+---
+- name: Install NTP
+  ansible.builtin.apt:
+    name:
+      - minidlna=1.3.3+dfsg-1build2
+    state: present
+    update_cache: yes
+  tags: dlna
+
+- name: Create media directory
+  ansible.builtin.file:
+    path: /srv/media
+    state: directory
+    mode: '0755'

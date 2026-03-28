@@ -1,0 +1,6 @@
+---
+# Default variables for the hostname role.
+# Set per-host (recommended) in host_vars/<hostname>.yml.
+
+# When empty, hostname management is skipped.
+ferria_hostname: ""

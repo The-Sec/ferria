@@ -1,0 +1,6 @@
+drbd_version: "9.2.14"
+drbd_tar_url: "https://pkg.linbit.com/downloads/drbd/9/drbd-{{ drbd_version }}.tar.gz"
+# Armbian headers package for ODROID XU4/HC2
+armbian_headers_pkg: "linux-headers-current-odroidxu4"
+# Where the built module lands (adjust if your make install path differs)
+drbd_module_path: "/lib/modules/{{ ansible_kernel }}/extra/drbd/drbd.ko"

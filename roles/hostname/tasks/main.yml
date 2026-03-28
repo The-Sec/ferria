@@ -1,0 +1,25 @@
+---
+# =============================================================================
+# Convergent role: manage static hostname
+# =============================================================================
+
+- name: Check whether hostname management is enabled
+  ansible.builtin.debug:
+    msg: "Hostname management disabled (ferria_hostname is empty)."
+  when: ferria_hostname | length == 0
+  changed_when: false
+  tags: [hostname]
+
+- name: Ensure static hostname is set
+  ansible.builtin.hostname:
+    name: "{{ ferria_hostname }}"
+  when: ferria_hostname | length > 0
+  tags: [hostname]
+
+- name: Verify current static hostname
+  ansible.builtin.command: hostnamectl --static
+  register: hostname_check
+  changed_when: false
+  failed_when: ferria_hostname | length > 0 and (hostname_check.stdout | trim) != ferria_hostname
+  when: ferria_hostname | length > 0
+  tags: [hostname]

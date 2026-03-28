@@ -1,0 +1,5 @@
+---
+- name: Restart time sync service
+  ansible.builtin.systemd:
+    name: "{{ ferria_time_sync_service }}"
+    state: restarted

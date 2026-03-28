@@ -1,0 +1,193 @@
+---
+# roles/linstor/tasks/controller.yaml
+# Run LINSTOR Controller on armhf by building from source (no apt package needed).
+# Reuses the same git checkout as the Satellite role (/opt/linstor/linstor-server).
+# If you have a prebuilt controller jar, set linstor_controller_jar_url and we skip the build.
+#
+# Vars you can override:
+#   linstor_controller_jar_url: ""    # optional prebuilt artifact
+#   linstor_server_version: "1.31.3"  # used only if we need to clone
+#   linstor_server_tag: "v{{ linstor_server_version }}"
+#   linstor_repo: "https://github.com/LINBIT/linstor-server.git"
+
+- name: Ensure deps for building controller
+  ansible.builtin.apt:
+    update_cache: true
+    state: present
+    name:
+      - ca-certificates
+      - curl
+      - git
+      - openjdk-17-jdk
+      - protobuf-compiler
+  tags: [linstor, linstor.controller]
+
+- name: Ensure base dirs exist
+  ansible.builtin.file:
+    path: "/opt/linstor"
+    state: directory
+    mode: "0755"
+  tags: [linstor, linstor.controller]
+
+- name: Use prebuilt controller jar if provided
+  when: linstor_controller_jar_url is defined and linstor_controller_jar_url|length > 0
+  block:
+    - ansible.builtin.get_url:
+        url: "{{ linstor_controller_jar_url }}"
+        dest: "/opt/linstor/linstor-controller.jar"
+        mode: "0644"
+    - ansible.builtin.file:
+        src: "/opt/linstor"
+        dest: "/opt/linstor/current"
+        state: link
+        force: true
+    - ansible.builtin.set_fact:
+        _controller_jar_ready: true
+  tags: [linstor, linstor.controller]
+
+- name: Compute repo/tag and src dir (safe defaults)
+  ansible.builtin.set_fact:
+    _linstor_ver: "{{ linstor_server_version | default('1.31.3') }}"
+    _linstor_tag: "{{ linstor_server_tag | default('v' ~ (linstor_server_version | default('1.31.3'))) }}"
+    _linstor_repo: "{{ linstor_repo | default('https://github.com/LINBIT/linstor-server.git') }}"
+    linstor_src_dir: "/opt/linstor/linstor-server"
+  when: not (_controller_jar_ready | default(false))
+  tags: [linstor, linstor.controller]
+
+- name: Clone/update linstor-server at tag for controller build
+  ansible.builtin.git:
+    repo: "{{ _linstor_repo }}"
+    dest: "{{ linstor_src_dir }}"
+    version: "{{ _linstor_tag }}"
+    recursive: true
+    update: true
+  when: not (_controller_jar_ready | default(false))
+  tags: [linstor, linstor.controller]
+
+- name: Ensure Gradle sees correct protoc (override any wrong-arch)
+  when: not (_controller_jar_ready | default(false))
+  block:
+    - ansible.builtin.command: bash -lc "command -v protoc || true"
+      register: _protoc
+      changed_when: false
+    - ansible.builtin.fail:
+        msg: "protobuf-compiler (protoc) not found in PATH. Install it first."
+      when: (_protoc.stdout | trim) == ''
+    - ansible.builtin.file:
+        path: "{{ linstor_src_dir }}/tools/protoc"
+        state: directory
+        mode: "0755"
+    - ansible.builtin.file:
+        path: "{{ linstor_src_dir }}/tools/protoc/bin"
+        state: directory
+        mode: "0755"
+    - ansible.builtin.file:
+        src: "{{ _protoc.stdout | trim }}"
+        dest: "{{ linstor_src_dir }}/tools/protoc/bin/protoc"
+        state: link
+        force: true
+    - ansible.builtin.find:
+        paths: "{{ linstor_src_dir }}/tools"
+        patterns: "protoc-*"
+        file_type: directory
+      register: _protoc_dirs
+    - ansible.builtin.file:
+        path: "{{ item.path }}/bin"
+        state: directory
+        mode: "0755"
+      loop: "{{ _protoc_dirs.files | default([]) }}"
+    - ansible.builtin.file:
+        path: "{{ item.path }}/bin/protoc"
+        state: absent
+      ignore_errors: true
+      loop: "{{ _protoc_dirs.files | default([]) }}"
+    - ansible.builtin.file:
+        src: "{{ _protoc.stdout | trim }}"
+        dest: "{{ item.path }}/bin/protoc"
+        state: link
+        force: true
+      loop: "{{ _protoc_dirs.files | default([]) }}"
+  tags: [linstor, linstor.controller]
+
+- name: Build controller with Gradle wrapper
+  ansible.builtin.command: ./gradlew :controller:assemble --no-daemon -x getProtoc
+  args:
+    chdir: "{{ linstor_src_dir }}"
+  environment:
+    JAVA_HOME: "/usr/lib/jvm/java-17-openjdk-armhf"
+    PATH: "{{ linstor_src_dir }}/tools/protoc/bin:{{ ansible_env.PATH }}"
+    PROTOC: "{{ _protoc.stdout | default('protoc') | trim }}"
+  when: not (_controller_jar_ready | default(false))
+  tags: [linstor, linstor.controller]
+
+- name: Locate built controller JAR
+  ansible.builtin.find:
+    paths:
+      - "{{ linstor_src_dir }}/controller/build/libs"
+      - "{{ linstor_src_dir }}/controller/build/install/controller/lib"
+    patterns:
+      - "linstor-controller*.jar"
+      - "controller*.jar"
+    recurse: true
+    file_type: file
+  register: _controller_jar_files
+  when: not (_controller_jar_ready | default(false))
+  tags: [linstor, linstor.controller]
+
+- name: Pick newest controller JAR
+  ansible.builtin.set_fact:
+    _controller_jar: "{{ (_controller_jar_files.files | sort(attribute='mtime', reverse=true))[0].path if (_controller_jar_files.matched | default(0) | int) > 0 else '' }}"
+  when: not (_controller_jar_ready | default(false))
+  tags: [linstor, linstor.controller]
+
+- name: Fail if controller jar not found
+  ansible.builtin.fail:
+    msg: "Controller jar not found in {{ linstor_src_dir }}/controller/build. Check Gradle output."
+  when: not (_controller_jar_ready | default(false)) and _controller_jar == ''
+  tags: [linstor, linstor.controller]
+
+- name: Link controller jar to stable path
+  ansible.builtin.file:
+    src: "{{ (_controller_jar_ready | default(false)) | ternary('/opt/linstor/linstor-controller.jar', _controller_jar) }}"
+    dest: "/opt/linstor/current/linstor-controller.jar"
+    state: link
+    force: true
+  tags: [linstor, linstor.controller]
+
+- name: Install systemd unit for linstor-controller
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/linstor-controller.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=LINSTOR Controller
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      User=root
+      Group=root
+      WorkingDirectory=/opt/linstor/current
+      ExecStart=/usr/bin/java -jar /opt/linstor/current/linstor-controller.jar --config-directory /etc/linstor
+      Restart=on-failure
+      RestartSec=2s
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  register: _ctrl_unit
+  tags: [linstor, linstor.controller]
+
+- name: Reload systemd if unit changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _ctrl_unit.changed
+  tags: [linstor, linstor.controller]
+
+- name: Ensure controller enabled and started
+  ansible.builtin.systemd:
+    name: linstor-controller
+    enabled: true
+    state: started
+  tags: [linstor, linstor.controller]

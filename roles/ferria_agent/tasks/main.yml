@@ -48,22 +48,23 @@
 
 # --- Verify age installation ---
 - name: Check if age binary is present
-  ansible.builtin.stat:
-    path: /usr/local/bin/age
-  register: age_stat
+  ansible.builtin.command: sh -c 'command -v age'
+  register: age_check
+  changed_when: false
+  failed_when: false
   tags: [ferria, age]
 
 - name: Install age via system package manager
   ansible.builtin.package:
     name: age
     state: present
-  when: not age_stat.stat.exists
+  when: age_check.rc != 0
   ignore_errors: true  # noqa: ignore-errors — fall through to GitHub download
   register: age_pkg
   tags: [ferria, age]
 
 - name: Install age from GitHub releases (fallback when not in package repos)
-  when: not age_stat.stat.exists and (age_pkg is failed or age_pkg.changed is not defined)
+  when: age_check.rc != 0 and (age_pkg is failed or age_pkg.changed is not defined)
   tags: [ferria, age]
   block:
     - name: Fetch age latest release info from GitHub

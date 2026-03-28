@@ -1,0 +1,1147 @@
+---
+# roles/linstor/tasks/main.yaml - Unified LINSTOR Installation
+# Installs LINSTOR Controller and/or Satellite based on configuration variables
+#
+# Required variables (in defaults/main.yaml):
+#   linstor.controller_host: Controller hostname/IP
+#   linstor_controller: false  # Set to true on controller node
+# Optional variables:
+#   linstor.controller_ip: ""     # Optional IP for /etc/hosts
+#   linstor_controller_jar_url: ""     # Optional prebuilt controller JAR
+#   linstor_satellite_jar_url: ""      # Optional prebuilt satellite JAR
+#   linstor_use_thin_provisioning: false
+#   linstor_skip_drbd_guard: false
+
+# ─────────────────────────── Variable validation and setup ───────────────────────────
+- name: Set installation flags based on configuration
+  ansible.builtin.set_fact:
+    _install_controller: "{{ linstor_controller | default(false) }}"
+    _install_satellite: "{{ not (linstor_controller | default(false)) or linstor_install_satellite | default(true) }}"
+    _controller_host: "{{ linstor.controller_host | default('') }}"
+    _controller_ip: "{{ linstor.controller_ip | default('') }}"
+  tags: [linstor, linstor.config]
+
+# ─────────────────────────── Controller connectivity validation (for satellites) ───────────────────────────
+- name: Assert controller_host provided for satellite installation
+  ansible.builtin.assert:
+    that: "_controller_host | length > 0"
+    fail_msg: "Set linstor.controller_host (IP or resolvable DNS name). Optionally linstor.controller_ip."
+  when: _install_satellite
+  tags: [linstor, linstor.config]
+
+- name: Try resolve controller_host
+  ansible.builtin.command: "getent hosts {{ _controller_host }}"
+  register: _getent1
+  changed_when: false
+  failed_when: false
+  when: _install_satellite
+  tags: [linstor, linstor.config]
+
+- name: Seed /etc/hosts if unresolved and controller_ip given
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ _controller_ip }} {{ _controller_host }}"
+    state: present
+    create: true
+  when: 
+    - _install_satellite
+    - _getent1.rc != 0 
+    - _controller_ip | length > 0
+  tags: [linstor, linstor.config]
+
+- name: Re-check resolution
+  ansible.builtin.command: "getent hosts {{ _controller_host }}"
+  register: _getent2
+  changed_when: false
+  failed_when: false
+  when: _install_satellite
+  tags: [linstor, linstor.config]
+
+- name: Fail if controller_host still unresolved
+  ansible.builtin.fail:
+    msg: "controller_host '{{ _controller_host }}' does not resolve. Use an IP or provide linstor.controller_ip to add /etc/hosts."
+  when: 
+    - _install_satellite
+    - _getent2.rc != 0
+  tags: [linstor, linstor.config]
+
+# ─────────────────────────── Essential packages (shared) ───────────────────────────
+- name: Install essential LINSTOR packages
+  ansible.builtin.apt:
+    update_cache: true
+    state: present
+    name:
+      - ca-certificates
+      - curl
+      - openjdk-17-jdk        # Java runtime - essential for both
+      - unzip                 # For JAR verification
+      # Satellite-specific packages
+      - "{{ 'lvm2' if _install_satellite else omit }}"
+      # Controller and source build packages
+      - "{{ 'git' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+      - "{{ 'gradle' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+      - "{{ 'protobuf-compiler' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+      - "{{ 'build-essential' if _install_controller or (linstor_satellite_jar_url is not defined) or (linstor_controller_jar_url is not defined) else omit }}"
+  tags: [linstor, linstor.install]
+
+- name: Install thin provisioning tools (satellite only, if enabled)
+  ansible.builtin.apt:
+    name: thin-provisioning-tools
+    state: present
+  when: 
+    - _install_satellite
+    - linstor_use_thin_provisioning | default(false)
+  tags: [linstor, linstor.install]
+
+# ─────────────────────────── DRBD check (satellite only) ─────────────────────────
+- name: Check DRBD availability (satellite only, if not skipped)
+  when: 
+    - _install_satellite
+    - not (linstor_skip_drbd_guard | default(false))
+  block:
+    - name: Load DRBD module
+      ansible.builtin.command: modprobe drbd
+      failed_when: false
+      changed_when: false
+      
+    - name: Verify DRBD version
+      ansible.builtin.shell: |
+        if ! modinfo drbd &>/dev/null; then
+          echo "DRBD module not available"
+          exit 1
+        fi
+        version=$(modinfo -F version drbd 2>/dev/null || echo "0.0")
+        if [[ ! "$version" =~ ^9\. ]]; then
+          echo "DRBD version $version is not >= 9.0"
+          exit 1
+        fi
+      args: { executable: /bin/bash }
+      register: _drbd_check
+      failed_when: _drbd_check.rc != 0
+  tags: [linstor, linstor.install]
+
+# ───────────────────── User and directories ─────────────────────
+- name: Setup LINSTOR user and directories
+  block:
+    - ansible.builtin.user:
+        name: linstor
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        
+    - ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "/opt/linstor", owner: "root", group: "root", mode: "0755" }
+        - { path: "/var/lib/linstor", owner: "linstor", group: "linstor", mode: "0755" }
+        - { path: "/var/log/linstor", owner: "linstor", group: "linstor", mode: "0755" }
+        - { path: "/etc/linstor", owner: "root", group: "root", mode: "0755" }
+  tags: [linstor, linstor.install]
+
+# ─────────────────────────── Shared configuration ─────────────────────────
+- name: Create LINSTOR environment file
+  ansible.builtin.copy:
+    dest: "/etc/linstor/linstor-{{ item }}.env"
+    mode: "0644"
+    content: |
+      # Java runtime options for LINSTOR {{ item | title }}
+      # Used by both systemd service and launcher script
+      LINSTOR_JAVA_OPTS=-Xms128m -Xmx{{ '512m' if item == 'controller' else '256m' }} -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Dfile.encoding=UTF-8
+  loop:
+    - "{{ 'controller' if _install_controller else omit }}"
+    - "{{ 'satellite' if _install_satellite else omit }}"
+  when: item != omit
+  tags: [linstor, linstor.install]
+
+- name: Write linstor-client.conf (satellite only)
+  ansible.builtin.copy:
+    dest: /etc/linstor/linstor-client.conf
+    mode: '0644'
+    content: |
+      [global]
+      controllers = {{ _controller_host }}:{{ linstor_controller_port | default('3370') }}
+  when: _install_satellite
+  notify: Restart LINSTOR satellite
+  tags: [linstor, linstor.config]
+
+# ───────────────────────── Installation from prebuilt JARs ─────────────────────────
+- name: Install controller from prebuilt JAR
+  when: 
+    - _install_controller
+    - linstor_controller_jar_url is defined
+  block:
+    - ansible.builtin.get_url:
+        url: "{{ linstor_controller_jar_url }}"
+        dest: "/opt/linstor/linstor-controller.jar"
+        mode: "0644"
+        timeout: 60
+        
+    - ansible.builtin.set_fact:
+        _linstor_controller_use_jar: true
+  tags: [linstor, linstor.install]
+
+- name: Install satellite from prebuilt JAR
+  when: 
+    - _install_satellite
+    - linstor_satellite_jar_url is defined
+  block:
+    - ansible.builtin.get_url:
+        url: "{{ linstor_satellite_jar_url }}"
+        dest: "/opt/linstor/linstor-satellite.jar"
+        mode: "0644"
+        timeout: 60
+        
+    - ansible.builtin.set_fact:
+        _linstor_satellite_use_jar: true
+  tags: [linstor, linstor.install]
+
+# ───────────────────────── Build from source (shared logic) ─────────────────────────
+- name: Build LINSTOR from source (when JARs not provided)
+  when: >
+    (_install_controller and linstor_controller_jar_url is not defined) or
+    (_install_satellite and linstor_satellite_jar_url is not defined)
+  block:
+    - name: Set build variables
+      ansible.builtin.set_fact:
+        _linstor_repo: "{{ linstor_repo | default('https://github.com/LINBIT/linstor-server.git') }}"
+        _linstor_tag: "{{ linstor_server_tag | default('v' ~ (linstor_server_version | default('1.31.3'))) }}"
+        linstor_src_dir: "/opt/linstor/linstor-server"
+        
+    - name: Clone LINSTOR source
+      ansible.builtin.git:
+        repo: "{{ _linstor_repo }}"
+        dest: "{{ linstor_src_dir }}"
+        version: "{{ _linstor_tag }}"
+        recursive: true
+        update: true
+        depth: 1
+        force: true
+
+    # Fix protoc for ARM builds (controller specific)
+    - name: Setup protoc for ARM builds (controller)
+      when: _install_controller and linstor_controller_jar_url is not defined
+      block:
+        - ansible.builtin.command: bash -lc "command -v protoc || true"
+          register: _protoc
+          changed_when: false
+          
+        - ansible.builtin.fail:
+            msg: "protobuf-compiler (protoc) not found in PATH. Install it first."
+          when: (_protoc.stdout | trim) == ''
+          
+        - ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ linstor_src_dir }}/tools/protoc"
+            - "{{ linstor_src_dir }}/tools/protoc/bin"
+            
+        - ansible.builtin.file:
+            src: "{{ _protoc.stdout | trim }}"
+            dest: "{{ linstor_src_dir }}/tools/protoc/bin/protoc"
+            state: link
+            force: true
+            
+        - name: Find protoc directories and fix them
+          ansible.builtin.find:
+            paths: "{{ linstor_src_dir }}/tools"
+            patterns: "protoc-*"
+            file_type: directory
+          register: _protoc_dirs
+          
+        - ansible.builtin.file:
+            path: "{{ item.path }}/bin"
+            state: directory
+            mode: "0755"
+          loop: "{{ _protoc_dirs.files | default([]) }}"
+          
+        - ansible.builtin.file:
+            path: "{{ item.path }}/bin/protoc"
+            state: absent
+          ignore_errors: true
+          loop: "{{ _protoc_dirs.files | default([]) }}"
+          
+        - ansible.builtin.file:
+            src: "{{ _protoc.stdout | trim }}"
+            dest: "{{ item.path }}/bin/protoc"
+            state: link
+            force: true
+          loop: "{{ _protoc_dirs.files | default([]) }}"
+
+    # FIXED: Use installDist instead of assemble for proper distribution with dependencies
+    - name: Build LINSTOR components
+      ansible.builtin.command:
+        cmd: >-
+          ./gradlew 
+          {{ ':controller:installDist -x getProtoc' if _install_controller and linstor_controller_jar_url is not defined else '' }}
+          {{ ':satellite:installDist' if _install_satellite and linstor_satellite_jar_url is not defined else '' }}
+          --no-daemon
+        chdir: "{{ linstor_src_dir }}"
+      environment:
+        GRADLE_OPTS: "-Xmx1024m"
+        JAVA_HOME: "{{ '/usr/lib/jvm/java-17-openjdk-armhf' if ansible_architecture == 'armv7l' else '/usr/lib/jvm/java-17-openjdk-amd64' }}"
+        PATH: "{{ linstor_src_dir }}/tools/protoc/bin:{{ ansible_env.PATH }}"
+        PROTOC: "{{ _protoc.stdout | default('protoc') | trim }}"
+      async: 1800
+      poll: 30
+
+    # Find built components - Updated for installDist structure
+    - name: Find built controller distribution
+      when: _install_controller and linstor_controller_jar_url is not defined
+      block:
+        - name: Check for controller distribution
+          ansible.builtin.stat:
+            path: "{{ linstor_src_dir }}/controller/build/install/controller"
+          register: _controller_dist
+          
+        - ansible.builtin.fail:
+            msg: "Controller distribution not found at {{ linstor_src_dir }}/controller/build/install/controller. Check Gradle output."
+          when: not _controller_dist.stat.exists
+          
+        - ansible.builtin.set_fact:
+            _controller_dist_path: "{{ linstor_src_dir }}/controller/build/install/controller"
+
+    - name: Find built satellite distribution and setup paths
+      when: _install_satellite and linstor_satellite_jar_url is not defined
+      block:
+        - name: Check for satellite distribution
+          ansible.builtin.stat:
+            path: "{{ linstor_src_dir }}/satellite/build/install/satellite"
+          register: _satellite_dist
+          
+        - ansible.builtin.fail:
+            msg: "Satellite distribution not found at {{ linstor_src_dir }}/satellite/build/install/satellite. Check Gradle output."
+          when: not _satellite_dist.stat.exists
+          
+        - ansible.builtin.set_fact:
+            _satellite_dist_path: "{{ linstor_src_dir }}/satellite/build/install/satellite"
+            _satellite_bin_path: "{{ linstor_src_dir }}/satellite/build/install/satellite/bin/Satellite"
+            _satellite_lib_path: "{{ linstor_src_dir }}/satellite/build/install/satellite/lib"
+            
+        - name: Verify satellite startup script exists
+          ansible.builtin.stat:
+            path: "{{ _satellite_bin_path }}"
+          register: _satellite_bin_check
+          
+        - ansible.builtin.fail:
+            msg: "Satellite startup script not found at {{ _satellite_bin_path }}"
+          when: not _satellite_bin_check.stat.exists
+
+    - name: Set facts for source builds
+      ansible.builtin.set_fact:
+        _linstor_controller_use_jar: "{{ linstor_controller_jar_url is defined }}"
+        _linstor_satellite_use_jar: "{{ linstor_satellite_jar_url is defined }}"
+        _linstor_satellite_use_distribution: "{{ _install_satellite and linstor_satellite_jar_url is not defined }}"
+  tags: [linstor, linstor.install, linstor.build]
+
+# ───────────────────── Systemd services ─────────────────────
+- name: Install systemd service for controller
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/linstor-controller.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=LINSTOR Controller
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      User=root
+      Group=root
+      EnvironmentFile=/etc/linstor/linstor-controller.env
+      {% if _linstor_controller_use_jar | default(false) %}
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -jar /opt/linstor/linstor-controller.jar --config-directory /etc/linstor
+      {% else %}
+      # Use manual classpath to ensure environment variables work properly
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -cp "{{ _controller_dist_path }}/lib/*" com.linbit.linstor.core.Controller --config-directory /etc/linstor
+      {% endif %}
+      Restart=on-failure
+      RestartSec=10s
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  register: _controller_systemd_unit
+  when: _install_controller
+  tags: [linstor, linstor.install]
+
+# FIXED: Updated satellite systemd service to use proper distribution structure
+- name: Install systemd service for satellite
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/linstor-satellite.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=LINSTOR Satellite
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=root
+      Group=root
+      EnvironmentFile=/etc/linstor/linstor-satellite.env
+      {% if _linstor_satellite_use_jar | default(false) %}
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -jar /opt/linstor/linstor-satellite.jar --config-directory /etc/linstor
+      {% elif _linstor_satellite_use_distribution | default(false) %}
+      # Use the generated startup script from installDist (recommended)
+      ExecStart={{ _satellite_bin_path }} --config-directory /etc/linstor
+      {% else %}
+      # Fallback to manual classpath (shouldn't reach here with updated build)
+      WorkingDirectory={{ linstor_src_dir }}
+      ExecStart=/usr/bin/java $LINSTOR_JAVA_OPTS -cp "{{ _satellite_lib_path }}/*" com.linbit.linstor.core.Satellite --config-directory /etc/linstor
+      {% endif %}
+      Restart=on-failure
+      RestartSec=10s
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+  register: _satellite_systemd_unit
+  when: _install_satellite
+  tags: [linstor, linstor.install]
+
+- name: Reload systemd and start services
+  block:
+    - ansible.builtin.systemd:
+        daemon_reload: true
+      when: (_controller_systemd_unit.changed | default(false)) or (_satellite_systemd_unit.changed | default(false))
+      
+    - ansible.builtin.systemd:
+        name: linstor-controller
+        enabled: true
+        state: started
+      when: _install_controller
+      
+    - ansible.builtin.systemd:
+        name: linstor-satellite
+        enabled: true
+        state: started
+      when: _install_satellite
+  tags: [linstor, linstor.install]
+
+# ───────────────────── Node Registration with Controller (satellite only) ─────────────────────
+- name: Install CLI and register satellite with controller
+  when: _install_satellite
+  block:
+    # Method 1: Try system packages first 
+    - name: Try installing linstor-client via system packages
+      ansible.builtin.apt:
+        state: present
+        name:
+          - python3-linstor-client
+        update_cache: true
+      register: _apt_linstor
+      failed_when: false
+
+    # Method 2: Install LINSTOR client from source (the actual CLI tool)
+    - name: Install LINSTOR client from source
+      when: _apt_linstor is failed or _apt_linstor.failed | default(false)
+      block:
+        - name: Install dependencies for LINSTOR client
+          ansible.builtin.apt:
+            state: present
+            name:
+              - python3-venv
+              - git
+
+        - name: Clone LINSTOR client repository
+          ansible.builtin.git:
+            repo: https://github.com/LINBIT/linstor-client.git
+            dest: /tmp/linstor-client
+            version: v1.25.0  # Use compatible version with python-linstor 1.25.3
+            depth: 1
+            force: true
+
+        - name: Remove any existing virtual environment
+          ansible.builtin.file:
+            path: /opt/linstor-cli
+            state: absent
+
+        - name: Create virtual environment for LINSTOR client
+          ansible.builtin.command:
+            cmd: python3 -m venv /opt/linstor-cli
+          args:
+            creates: /opt/linstor-cli/bin/activate
+
+        - name: Install LINSTOR client from source
+          ansible.builtin.pip:
+            name: /tmp/linstor-client
+            virtualenv: /opt/linstor-cli
+            editable: false
+          register: _client_install
+
+    # Method 3: Fallback - try to use controller tools directly
+    - name: Check for controller-based client tools
+      when: 
+        - (_apt_linstor is failed or _apt_linstor.failed | default(false))
+        - (_client_install is failed or _client_install.failed | default(false))
+      block:
+        - name: Look for controller client functionality
+          ansible.builtin.find:
+            paths:
+              - "/opt/linstor/linstor-server/controller/build"
+              - "/opt/linstor/linstor-server/build"
+            patterns:
+              - "*controller*.jar"
+              - "Controller"
+            recurse: true
+          register: _controller_tools
+
+        - name: Create controller-based client wrapper
+          ansible.builtin.copy:
+            dest: /opt/linstor-cli-wrapper.sh
+            mode: '0755'
+            content: |
+              #!/bin/bash
+              # LINSTOR Client wrapper using controller tools
+              # This is a fallback when no dedicated client is available
+              
+              echo "Warning: Using controller tools as LINSTOR client fallback"
+              echo "For full client functionality, install the dedicated LINSTOR client"
+              
+              # Try to use controller JAR with client mode (if supported)
+              CONTROLLER_JAR="{{ (_controller_tools.files | selectattr('path', 'match', '.*controller.*\\.jar$') | list)[0].path if _controller_tools.matched > 0 else '' }}"
+              
+              if [ -n "$CONTROLLER_JAR" ] && [ -f "$CONTROLLER_JAR" ]; then
+                exec java -cp "$CONTROLLER_JAR" com.linbit.linstor.core.ControllerLinstorModule --client "$@"
+              else
+                echo "Error: No LINSTOR client or controller tools found"
+                exit 1
+              fi
+          when: _controller_tools.matched > 0
+
+    # Find the LINSTOR CLI executable
+    - name: Find linstor CLI executable
+      ansible.builtin.shell: |
+        # Check virtual environment first
+        if [ -x "/opt/linstor-cli/bin/linstor" ]; then
+          echo "/opt/linstor-cli/bin/linstor"
+          exit 0
+        fi
+        
+        # Check system-wide installations
+        for cmd in \
+          linstor \
+          /usr/bin/linstor \
+          /usr/local/bin/linstor; do
+          if command -v "$cmd" >/dev/null 2>&1; then
+            echo "$cmd"
+            exit 0
+          fi
+        done
+        
+        # Check fallback wrapper
+        if [ -x "/opt/linstor-cli-wrapper.sh" ]; then
+          echo "/opt/linstor-cli-wrapper.sh"
+          exit 0
+        fi
+        
+        exit 1
+      register: _linstor_cli_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set linstor CLI executable path
+      ansible.builtin.set_fact:
+        _linstor_cli_executable: "{{ _linstor_cli_check.stdout | trim }}"
+      when: _linstor_cli_check.rc == 0
+
+    - name: Fail if linstor CLI not found after all attempts
+      ansible.builtin.fail:
+        msg: |
+          LINSTOR CLI not found after trying installation methods:
+          - System packages: {{ 'failed' if (_apt_linstor is failed or _apt_linstor.failed | default(false)) else 'success' }}
+          - Source installation: {{ 'failed' if (_client_install is failed or _client_install.failed | default(false)) else 'success' }}
+          - Controller tools: {{ _controller_tools.matched | default(0) }} found
+          
+          Manual troubleshooting:
+          1. Try: git clone https://github.com/LINBIT/linstor-client.git /tmp/linstor-client
+          2. Try: python3 -m venv /opt/linstor-cli && /opt/linstor-cli/bin/pip install /tmp/linstor-client
+          3. Test: /opt/linstor-cli/bin/linstor --version
+      when: _linstor_cli_check.rc != 0 or (_linstor_cli_executable | default('')) == ''
+
+    - name: Verify CLI installation
+      ansible.builtin.command: "{{ _linstor_cli_executable }} --version"
+      register: _cli_version
+      changed_when: false
+      failed_when: false
+
+    - name: Show CLI version
+      ansible.builtin.debug:
+        msg: "LINSTOR CLI installed: {{ _linstor_cli_executable }} ({{ _cli_version.stdout if _cli_version.rc == 0 else 'version check failed' }})"
+
+    # Continue with node registration
+    - name: Determine this node's IP address and name
+      ansible.builtin.set_fact:
+        _node_ip: "{{ (hostvars[inventory_hostname].ansible_default_ipv4.address | default(ansible_all_ipv4_addresses[0])) }}"
+        _node_name: "{{ inventory_hostname }}"
+
+    - name: Set controller endpoint for registration
+      ansible.builtin.set_fact:
+        _controllers: "{{ _controller_host }}:{{ linstor_controller_port | default(3370) }}"
+
+    - name: Wait for LINSTOR Satellite service to be ready
+      ansible.builtin.wait_for:
+        port: 3366
+        host: "{{ _node_ip }}"
+        timeout: 60
+        delay: 5
+    
+    - name: Register node with controller (idempotent)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - node
+          - create
+          - "{{ _node_name }}"
+          - "{{ _node_ip }}"
+      register: _node_create
+      failed_when: >
+        _node_create.rc != 0 and
+        ('already exists' not in (_node_create.stdout ~ _node_create.stderr))
+      changed_when: _node_create.rc == 0
+    
+    - name: Show registration output
+      ansible.builtin.debug:
+        var: _node_create.stdout_lines
+      when: _node_create.stdout_lines is defined
+    
+        # Robust verification: query this node only; rely on rc, no JSON parsing
+    - name: Verify node registration (exact via node info)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - -m
+          - node
+          - info
+          - -n
+          - "{{ _node_name }}"
+      register: _node_info
+      changed_when: false
+      failed_when: _node_info.rc != 0
+
+    - name: Display registration success
+      ansible.builtin.debug:
+        msg: "Node {{ _node_name }} successfully registered with LINSTOR controller at {{ _controllers }}"
+      tags: [linstor, linstor.register]
+
+    - name: Define lvmthin thin-pool LV path
+      ansible.builtin.set_fact:
+        _thin_lv_dev: "{{ linstor.vg_name }}/{{ linstor.thinpool_name }}"
+
+    # Try legacy/path syntax: lvmthin <node> <pool> <vg>/<thinpool>
+    - name: Create lvmthin storage pool (path syntax first)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - storage-pool
+          - create
+          - lvmthin
+          - "{{ _node_name }}"
+          - "{{ linstor.storage_pool_name }}"
+          - "{{ _thin_lv_dev }}"
+      register: _sp_path
+      failed_when: false
+      changed_when: >
+        _sp_path.rc == 0 and
+        ('already' not in (((_sp_path.stdout ~ _sp_path.stderr) | lower))) and
+        ('exists'  not in (((_sp_path.stdout ~ _sp_path.stderr) | lower))) and
+        ('present' not in (((_sp_path.stdout ~ _sp_path.stderr) | lower)))
+      tags: [linstor, linstor.storage_pool]
+
+    # Fallback to newer syntax: lvmthin <node> <pool> <vg> <thinpool>
+    - name: Create lvmthin storage pool (fallback vg+thin syntax)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - storage-pool
+          - create
+          - lvmthin
+          - "{{ _node_name }}"
+          - "{{ linstor.storage_pool_name }}"
+          - "{{ linstor.vg_name }}"
+          - "{{ linstor.thinpool_name }}"
+      when: >
+        _sp_path.rc != 0 and
+        ('already' not in (((_sp_path.stdout ~ _sp_path.stderr) | lower))) and
+        ('exists'  not in (((_sp_path.stdout ~ _sp_path.stderr) | lower))) and
+        ('present' not in (((_sp_path.stdout ~ _sp_path.stderr) | lower)))
+      register: _sp_vg
+      failed_when: false
+      changed_when: >
+        _sp_vg.rc == 0 and
+        ('already' not in (((_sp_vg.stdout ~ _sp_vg.stderr) | lower))) and
+        ('exists'  not in (((_sp_vg.stdout ~ _sp_vg.stderr) | lower))) and
+        ('present' not in (((_sp_vg.stdout ~ _sp_vg.stderr) | lower)))
+      tags: [linstor, linstor.storage_pool]
+
+    # Final guard: only fail if both variants failed and it wasn’t an idempotent “already/exists/present”
+    - name: Ensure lvmthin storage pool creation succeeded or was already present
+      ansible.builtin.assert:
+        that:
+          - >
+            (_sp_path.rc == 0) or
+            ('already' in (((_sp_path.stdout ~ _sp_path.stderr) | lower))) or
+            ('exists'  in (((_sp_path.stdout ~ _sp_path.stderr) | lower))) or
+            ('present' in (((_sp_path.stdout ~ _sp_path.stderr) | lower))) or
+            (
+              _sp_vg is defined and
+              (
+                (_sp_vg.rc == 0) or
+                ('already' in (((_sp_vg.stdout ~ _sp_vg.stderr) | lower))) or
+                ('exists'  in (((_sp_vg.stdout ~ _sp_vg.stderr) | lower))) or
+                ('present' in (((_sp_vg.stdout ~ _sp_vg.stderr) | lower)))
+              )
+            )
+        fail_msg: >-
+          Failed to create lvmthin storage pool '{{ linstor.storage_pool_name }}' on node '{{ _node_name }}'
+          using both syntax variants (path and vg+thin). Check LV path
+          {{ _thin_lv_dev }} exists and LINSTOR controller {{ _controllers }} is reachable.
+      tags: [linstor, linstor.storage_pool]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Determine candidate nodes FROM CONTROLLER (not inventory) for this pool
+    # ─────────────────────────────────────────────────────────────────────────────
+    - name: Query controller for node list (JSON)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - -m
+          - node
+          - list
+      register: _nodes_raw
+      changed_when: false
+      failed_when: _nodes_raw.rc != 0
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    # IMPORTANT: 'storage-pool list' has no pool-name positional filter. List all, then filter.
+    - name: Query controller for all storage-pools (JSON)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - -m
+          - storage-pool
+          - list
+      register: _pools_raw
+      changed_when: false
+      failed_when: _pools_raw.rc != 0
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Parse controller JSON → node/pool arrays
+      ansible.builtin.set_fact:
+        _node_list: "{{ (_nodes_raw.stdout | default('[]')) | from_json }}"
+        _pool_list_all: "{{ (_pools_raw.stdout | default('[]')) | from_json }}"
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Build list of ONLINE/CONNECTED nodes
+      ansible.builtin.set_fact:
+        _online_nodes: "{{ (_online_nodes | default([])) + [ item.name | default(item.NodeName | default(item.node_name | default(''))) ] }}"
+      loop: "{{ _node_list | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default(item.NodeName | default(item.node_name | default('unknown'))) }}"
+      when: >
+        ((item.connection_status | default(item.ConnectionStatus | default(item.status | default('')))) | lower) is search('online|connected')
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Filter pools to requested name and healthy state
+      ansible.builtin.set_fact:
+        _pool_list: >-
+          {{
+            (_pool_list_all | default([]))
+            | selectattr('storage_pool_name', 'defined')
+            | selectattr('storage_pool_name', 'equalto', linstor.storage_pool_name)
+            | list
+            +
+            (
+              (_pool_list_all | default([]))
+              | rejectattr('storage_pool_name', 'defined')
+              | selectattr('StorPoolName', 'defined')
+              | selectattr('StorPoolName', 'equalto', linstor.storage_pool_name)
+              | list
+            )
+          }}
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Build list of nodes that have OK storage pool '{{ linstor.storage_pool_name }}'
+      ansible.builtin.set_fact:
+        _pool_nodes: "{{ (_pool_nodes | default([])) + [ item.node_name | default(item.NodeName | default(item.node | default(''))) ] }}"
+      loop: "{{ _pool_list | default([]) }}"
+      loop_control:
+        label: "{{ item.node_name | default(item.NodeName | default(item.node | default('unknown'))) }}"
+      when: >
+        ((item.state | default(item.PoolStatus | default(item.pool_status | default('ok')))) | lower) is search('ok|online')
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Intersect ONLINE nodes with pool-present nodes → candidates
+      ansible.builtin.set_fact:
+        _candidate_nodes: "{{ (_online_nodes | default([])) | intersect(_pool_nodes | default([])) }}"
+      tags: [linstor, linstor.place, linstor.inspect]
+
+        # Normalize pool records across client versions and collect nodes that actually have the target pool healthy
+    - name: Reset computed pool node list
+      ansible.builtin.set_fact:
+        _pool_nodes: []
+
+    - name: Collect nodes that have healthy target pool '{{ linstor.storage_pool_name }}' (robust JSON schema)
+      ansible.builtin.set_fact:
+        _pool_nodes: "{{ _pool_nodes + [ _pnode ] }}"
+      vars:
+        _pname: >-
+          {{
+            item.storage_pool_name
+              | default(item.StoragePool
+              | default(item.StorPoolName
+              | default(item.storage_pool
+              | default(item.PoolName
+              | default(item.pool_name
+              | default(item.name
+              | default('')))))))
+          }}
+        _pnode: >-
+          {{
+            item.node_name
+              | default(item.NodeName
+              | default(item.node
+              | default(item.Node
+              | default(''))))
+          }}
+        _pstate: >-
+          {{
+            item.state
+              | default(item.State
+              | default(item.pool_status
+              | default(item.PoolStatus
+              | default(''))))
+          }}
+        _pdriver: >-
+          {{
+            item.driver
+              | default(item.Driver
+              | default(''))
+          }}
+      when:
+        - _pname == linstor.storage_pool_name
+        - (_pstate | lower) in ['ok','online']
+        - (_pdriver | upper) != 'DISKLESS'
+      loop: "{{ _pool_list_all | default([]) }}"
+      loop_control:
+        label: "{{ _pnode }}: {{ _pname }} ({{ _pdriver }}, {{ _pstate }})"
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Intersect ONLINE nodes with pool-present nodes → candidates
+      ansible.builtin.set_fact:
+        _candidate_nodes: "{{ (_online_nodes | default([])) | intersect(_pool_nodes | default([])) }}"
+      tags: [linstor, linstor.place, linstor.inspect]
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Resource Definitions — idempotent create (no pre-check)
+    # ─────────────────────────────────────────────────────────────────────────────
+    - name: Ensure resource definitions exist (idempotent create)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - resource-definition
+          - create
+          - "{{ item.name }}"
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      register: rd
+      changed_when: >
+        rd.rc == 0 and
+        ('already' not in ((rd.stdout ~ rd.stderr) | lower)) and
+        ('exists'  not in ((rd.stdout ~ rd.stderr) | lower)) and
+        ('present' not in ((rd.stdout ~ rd.stderr) | lower))
+      failed_when: >
+        rd.rc != 0 and
+        ('already' not in ((rd.stdout ~ rd.stderr) | lower)) and
+        ('exists'  not in ((rd.stdout ~ rd.stderr) | lower)) and
+        ('present' not in ((rd.stdout ~ rd.stderr) | lower))
+      tags: [linstor, linstor.resdefs]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Volume Definitions — idempotent create (no pre-check)
+    # ─────────────────────────────────────────────────────────────────────────────
+    - name: Ensure volume definitions exist (idempotent create)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - volume-definition
+          - create
+          - "{{ item.name }}"
+          - "{{ item.size }}"
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      register: vd
+      changed_when: >
+        vd.rc == 0 and
+        ('already' not in ((vd.stdout ~ vd.stderr) | lower)) and
+        ('exists'  not in ((vd.stdout ~ vd.stderr) | lower)) and
+        ('present' not in ((vd.stdout ~ vd.stderr) | lower))
+      failed_when: >
+        vd.rc != 0 and
+        ('already' not in ((vd.stdout ~ vd.stderr) | lower)) and
+        ('exists'  not in ((vd.stdout ~ vd.stderr) | lower)) and
+        ('present' not in ((vd.stdout ~ vd.stderr) | lower))
+      tags: [linstor, linstor.voldefs]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Effective replicas per resource (controller-driven, not inventory)
+    # ─────────────────────────────────────────────────────────────────────────────
+    - name: Initialize effective replica map
+      ansible.builtin.set_fact:
+        _effective_map: {}
+      tags: [linstor, linstor.place]
+
+    - name: Compute effective replicas per resource
+      ansible.builtin.set_fact:
+        _effective_map: "{{ _effective_map | combine({ item.name: ([ (item.replicas | default(2)) | int, (_candidate_nodes | length) ] | min) }) }}"
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      tags: [linstor, linstor.place]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Placement — stage-friendly initial placement (works with 1 node)
+    # ─────────────────────────────────────────────────────────────────────────────
+    - name: Place resources with effective replicas (idempotent)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - resource
+          - create
+          - --auto-place
+          - "{{ _effective_map[item.name] | string }}"
+          - "{{ item.name }}"
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      register: plc_effective
+      changed_when: >
+        plc_effective.rc == 0 and
+        ('already' not in ((plc_effective.stdout ~ plc_effective.stderr) | lower)) and
+        ('exists'  not in ((plc_effective.stdout ~ plc_effective.stderr) | lower)) and
+        ('present' not in ((plc_effective.stdout ~ plc_effective.stderr) | lower))
+      failed_when: >
+        plc_effective.rc != 0 and
+        ('already' not in ((plc_effective.stdout ~ plc_effective.stderr) | lower)) and
+        ('exists'  not in ((plc_effective.stdout ~ plc_effective.stderr) | lower)) and
+        ('present' not in ((plc_effective.stdout ~ plc_effective.stderr) | lower))
+      tags: [linstor, linstor.place]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Top-up later: delta = effective − current (idempotent & safe)
+    # ─────────────────────────────────────────────────────────────────────────────
+    - name: Query current placements per resource (JSON)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - -m
+          - resource
+          - list
+          - -r
+          - "{{ item.name }}"
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      register: _res_list_json
+      changed_when: false
+      failed_when: false
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Build current placement count map
+      ansible.builtin.set_fact:
+        _current_map: "{{ _current_map | default({}) | combine({ item.item.name: (item.stdout is not none and (item.stdout | from_json) is iterable) | ternary(((item.stdout | from_json) | length), 0) }) }}"
+      loop: "{{ _res_list_json.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('unknown') }}"
+      tags: [linstor, linstor.place, linstor.inspect]
+
+    - name: Compute delta (effective − current) per resource
+      ansible.builtin.set_fact:
+        _delta_map: "{{ _delta_map | default({}) | combine({ item.name: [ (_effective_map[item.name] | int) - (_current_map[item.name] | default(0) | int), 0 ] | max }) }}"
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      tags: [linstor, linstor.place]
+
+    - name: Add missing replicas where delta > 0
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - resource
+          - create
+          - --auto-place
+          - "{{ _delta_map[item.name] | string }}"
+          - "{{ item.name }}"
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      when: _delta_map[item.name] | int > 0
+      register: plc_topup
+      changed_when: >
+        plc_topup.rc == 0 and
+        ('already' not in ((plc_topup.stdout ~ plc_topup.stderr) | lower)) and
+        ('exists'  not in ((plc_topup.stdout ~ plc_topup.stderr) | lower)) and
+        ('present' not in ((plc_topup.stdout ~ plc_topup.stderr) | lower))
+      failed_when: >
+        plc_topup.rc != 0 and
+        ('already' not in ((plc_topup.stdout ~ plc_topup.stderr) | lower)) and
+        ('exists'  not in ((plc_topup.stdout ~ plc_topup.stderr) | lower)) and
+        ('present' not in ((plc_topup.stdout ~ plc_topup.stderr) | lower))
+      tags: [linstor, linstor.place, linstor.topup]
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Promote/mkfs/mount only on declared primary for this node
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    # Try modern syntax first: 'resource promote <res> --node <node>'
+    - name: Promote shard(s) to Primary (variant A --node)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - resource
+          - promote
+          - "{{ item.name }}"
+          - --node
+          - "{{ _node_name }}"
+      when: (item.primary | default('')) == _node_name
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      register: prom_a
+      failed_when: false
+      changed_when: >
+        prom_a.rc == 0 and
+        ('already' not in ((prom_a.stdout ~ prom_a.stderr) | lower)) and
+        ('primary' not in ((prom_a.stdout ~ prom_a.stderr) | lower))
+      tags: [linstor, linstor.promote]
+
+    # Fallback syntax: 'resource promote <node> <res>'
+    - name: Promote shard(s) to Primary (variant B node then res)
+      ansible.builtin.command:
+        argv:
+          - "{{ _linstor_cli_executable }}"
+          - --controllers
+          - "{{ _controllers }}"
+          - resource
+          - promote
+          - "{{ _node_name }}"
+          - "{{ item.name }}"
+      when: >
+        (item.primary | default('')) == _node_name and
+        (prom_a is defined) and (prom_a.rc | default(0)) != 0 and
+        ('unrecognized' in ((prom_a.stderr | default('')) | lower))
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      register: prom_b
+      failed_when: prom_b.rc not in [0, 126, 127]
+      changed_when: >
+        prom_b.rc == 0 and
+        ('already' not in ((prom_b.stdout ~ prom_b.stderr) | lower)) and
+        ('primary' not in ((prom_b.stdout ~ prom_b.stderr) | lower))
+      tags: [linstor, linstor.promote]
+
+    - name: Ensure mount point exists
+      ansible.builtin.file:
+        path: "{{ item.mount }}"
+        state: directory
+        mode: "0755"
+      when: (item.primary | default('')) == _node_name
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      tags: [linstor, linstor.mount]
+
+    # Only act on resources that should be Primary on this node
+    - name: Wait for DRBD device to appear on primary
+      ansible.builtin.stat:
+        path: "/dev/drbd/by-resource/{{ item.name }}/0"
+      register: drbd_dev
+      until: drbd_dev.stat.exists
+      retries: 30
+      delay: 2
+      when: (item.primary | default('')) == _node_name
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      tags: [linstor, linstor.mount]
+
+    # Probe existing filesystem (only where we’re primary)
+    - name: Probe existing filesystem
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -o
+          - value
+          - -s
+          - TYPE
+          - "/dev/drbd/by-resource/{{ item.name }}/0"
+      when: (item.primary | default('')) == _node_name
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      register: fsprobe
+      failed_when: false
+      changed_when: false
+      tags: [linstor, linstor.mount]
+
+    # Make filesystem if absent — tolerate 'skipped' / missing rc/stdout in loop items
+    - name: Make filesystem if absent
+      community.general.filesystem:
+        fstype: "{{ linstor.fs_type }}"
+        dev: "/dev/drbd/by-resource/{{ item.item.name }}/0"
+      loop: "{{ fsprobe.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('unknown') }}"
+      when:
+        - item is defined
+        - not (item.skipped | default(false))
+        - ((item.rc | default(1)) != 0) or ((item.stdout | default('') | trim) == '')
+      tags: [linstor, linstor.mount]
+
+    - name: Mount filesystem
+      ansible.builtin.mount:
+        path: "{{ item.mount }}"
+        src: "/dev/drbd/by-resource/{{ item.name }}/0"
+        fstype: "{{ linstor.fs_type }}"
+        opts: "noatime,nodiratime"
+        state: mounted
+      when: (item.primary | default('')) == _node_name
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      tags: [linstor, linstor.mount]
+
+    - name: Persist mount in fstab
+      ansible.builtin.mount:
+        path: "{{ item.mount }}"
+        src: "/dev/drbd/by-resource/{{ item.name }}/0"
+        fstype: "{{ linstor.fs_type }}"
+        opts: "noatime,nodiratime"
+        state: present
+      when: (item.primary | default('')) == _node_name
+      loop: "{{ linstor_resources }}"
+      loop_control: { loop_var: item }
+      tags: [linstor, linstor.mount]

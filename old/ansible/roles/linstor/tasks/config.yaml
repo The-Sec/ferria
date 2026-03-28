@@ -1,0 +1,39 @@
+---
+- name: Assert controller_host provided
+  ansible.builtin.assert:
+    that: "linstor.controller_host | length > 0"
+    fail_msg: "Set linstor.controller_host (IP or resolvable DNS name). Optionally linstor.controller_ip."
+
+- name: Try resolve controller_host
+  ansible.builtin.command: "getent hosts {{ linstor.controller_host }}"
+  register: _getent1
+  changed_when: false
+  failed_when: false
+
+- name: Seed /etc/hosts if unresolved and controller_ip given
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ linstor.controller_ip }} {{ linstor.controller_host }}"
+    state: present
+    create: true
+  when: _getent1.rc != 0 and (linstor.controller_ip | length > 0)
+
+- name: Re-check resolution
+  ansible.builtin.command: "getent hosts {{ linstor.controller_host }}"
+  register: _getent2
+  changed_when: false
+  failed_when: false
+
+- name: Fail if controller_host still unresolved
+  ansible.builtin.fail:
+    msg: "controller_host '{{ linstor.controller_host }}' does not resolve. Use an IP or provide linstor.controller_ip to add /etc/hosts."
+  when: _getent2.rc != 0
+
+- name: Write linstor-client.conf
+  ansible.builtin.copy:
+    dest: /etc/linstor/linstor-client.conf
+    mode: '0644'
+    content: |
+      [global]
+      controllers = {{ linstor.controller_host }}:3370
+  notify: Restart LINSTOR satellite

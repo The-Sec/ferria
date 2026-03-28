@@ -1,0 +1,13 @@
+linstor:
+  controller_host: "192.168.81.156"   # IP or resolvable name of the controller
+  controller_ip: "192.168.81.156"     # optional; lets the role add /etc/hosts if needed
+  storage_pool_name: "pool1"
+  vg_name: "vgdata"
+  thinpool_name: "tpool"
+  fs_type: "xfs"
+
+# All shards share the same thin-pool
+linstor_resources:
+  - { name: "media",    size: "1T",  primary: "brk01", mount: "/srv/media",    replicas: 1 }
+  - { name: "appdata",  size: "1T",  primary: "brk02", mount: "/srv/appdata",  replicas: 2 }
+  - { name: "personal", size: "2T",  primary: "brk01", mount: "/srv/personal", replicas: 2 }

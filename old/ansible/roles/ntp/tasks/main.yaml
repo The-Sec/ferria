@@ -1,0 +1,26 @@
+---
+- name: Install NTP
+  ansible.builtin.apt:
+    name:
+      - ntpsec=1.2.2+dfsg1-1+deb12u1
+    state: present
+    update_cache: yes
+  tags: ntp
+  
+- name: Copy over the NTP configuration
+  ansible.builtin.copy:
+    src: ntp.conf
+    dest: /etc/ntpsec/ntp.conf
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - restart ntp
+  tags: ntp
+
+- name: Make sure NTP is started up
+  ansible.builtin.systemd_service:
+    name: ntp
+    enabled: true
+    state: started
+  tags: ntp

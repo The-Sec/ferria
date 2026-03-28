@@ -1,0 +1,13 @@
+---
+# Default variables for the time_sync role.
+
+ferria_time_sync_package: "chrony"
+ferria_time_sync_service: "{{ 'chronyd' if ansible_facts['os_family'] in ['RedHat', 'Suse'] else 'chrony' }}"
+ferria_time_sync_config_path: "{{ '/etc/chrony.conf' if ansible_facts['os_family'] in ['RedHat', 'Suse'] else '/etc/chrony/chrony.conf' }}"
+
+# Upstream NTP sources used by chrony.
+ferria_time_sync_sources:
+  - "pool 0.pool.ntp.org iburst"
+  - "pool 1.pool.ntp.org iburst"
+  - "pool 2.pool.ntp.org iburst"
+  - "pool 3.pool.ntp.org iburst"

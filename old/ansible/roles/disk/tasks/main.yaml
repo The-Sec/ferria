@@ -1,0 +1,266 @@
+---
+# roles/disk/tasks/main.yaml
+
+# Inline defaults (override in host_vars/group_vars if desired)
+- name: Set disk role defaults
+  ansible.builtin.set_fact:
+    data_device: "{{ data_device | default('/dev/sda') }}"
+    vg_name: "{{ vg_name | default('vgdata') }}"
+    thinpool_name: "{{ thinpool_name | default('tpool') }}"
+    thinpool_size: "{{ thinpool_size | default('90%FREE') }}"
+    fs_base: "{{ fs_base | default('/srv') }}"
+    force_rebuild: "{{ (force_rebuild | default(false)) | bool }}"
+
+# Safety: avoid the SD card
+- name: Guard - only operate on /dev/sdX devices
+  ansible.builtin.assert:
+    that:
+      - data_device is match('^/dev/sd[a-z]+$')
+    fail_msg: "Refusing to operate on {{ data_device }} (did you point at the SD card, e.g. /dev/mmcblk2?)"
+
+# Prereqs
+- name: Ensure storage tooling is installed
+  ansible.builtin.apt:
+    name:
+      - lvm2
+      - thin-provisioning-tools
+      - parted
+      - util-linux
+    state: present
+    update_cache: true
+
+- name: Ensure base dir exists (no mount here)
+  ansible.builtin.file:
+    path: "{{ fs_base }}"
+    state: directory
+    mode: '0755'
+
+# Make sure kernel view is fresh BEFORE detection
+- name: Rescan partition table and settle
+  ansible.builtin.shell: "partprobe {{ data_device }} || true; udevadm settle"
+  changed_when: false
+
+# ---- Detect current state ----
+- name: Get lsblk JSON for device
+  ansible.builtin.command: "lsblk -J -o NAME,TYPE,PTTYPE,PARTTYPE,MOUNTPOINT,FSTYPE,PKNAME {{ data_device }}"
+  register: lsblk_json
+  changed_when: false
+
+- name: Parse lsblk info
+  ansible.builtin.set_fact:
+    _lsblk: "{{ lsblk_json.stdout | from_json }}"
+    pttype: "{{ (lsblk_json.stdout | from_json).blockdevices[0].pttype | default('') }}"
+    parttypes: "{{ ((lsblk_json.stdout | from_json).blockdevices[0].children | default([])) | map(attribute='parttype') | list }}"
+    mounts_on_disk: >-
+      {{ ((lsblk_json.stdout | from_json).blockdevices[0].children | default([]))
+         | selectattr('mountpoint','defined')
+         | map(attribute='mountpoint') | select('truthy') | list }}
+
+# Is there a Linux LVM partition? (GPT GUID for LVM)
+- name: Determine if an LVM partition exists
+  ansible.builtin.set_fact:
+    has_lvm_part: "{{ 'e6d6d379-f507-44c2-a23c-238f2a3df928' in (parttypes | map('lower') | list) }}"
+
+# PV/VG detection on partition 1
+- name: Check PV membership of partition 1
+  ansible.builtin.command: "pvs --noheadings -o vg_name,pv_name --separator=: {{ data_device }}1"
+  register: pvs_out
+  failed_when: false
+  changed_when: false
+
+# Split into two set_fact steps so we don't self-reference
+- name: Parse PV/VG existence and fields
+  ansible.builtin.set_fact:
+    pv_exists: "{{ (pvs_out.rc == 0) and (pvs_out.stdout | trim | length > 0) }}"
+    pv_vg: "{{ (pvs_out.stdout | trim | length > 0) | ternary((pvs_out.stdout | trim).split(':')[0] | trim, '') }}"
+    pv_name: "{{ (pvs_out.stdout | trim | length > 0) | ternary((pvs_out.stdout | trim).split(':')[-1] | trim, '') }}"
+
+- name: Compute pv_is_expected
+  ansible.builtin.set_fact:
+    pv_is_expected: "{{ pv_exists and (pv_vg == vg_name) and (pv_name == data_device + '1') }}"
+
+- name: Check if the specific thin-pool exists
+  ansible.builtin.command: "lvs --noheadings {{ vg_name }}/{{ thinpool_name }}"
+  register: lvs_tp
+  failed_when: false
+  changed_when: false
+
+- name: Set thinpool_exists fact
+  ansible.builtin.set_fact:
+    thinpool_exists: "{{ lvs_tp.rc == 0 and (lvs_tp.stdout | trim | length) > 0 }}"
+
+# State classification
+- name: Decide state (correct / repair / init / conflict)
+  ansible.builtin.set_fact:
+    state_correct: "{{ pv_is_expected and thinpool_exists }}"
+    state_repair:  "{{ pv_is_expected and (not thinpool_exists) }}"
+    state_init:    "{{ not pv_exists }}"
+    state_conflict: "{{ pv_exists and (not pv_is_expected) }}"
+
+# State summary for logs
+- name: State summary
+  ansible.builtin.debug:
+    msg:
+      data_device: "{{ data_device }}"
+      pttype: "{{ pttype }}"
+      pv_exists: "{{ pv_exists }}"
+      pv_vg: "{{ pv_vg }}"
+      pv_name: "{{ pv_name }}"
+      thinpool_exists: "{{ thinpool_exists }}"
+      state_correct: "{{ state_correct }}"
+      state_repair: "{{ state_repair }}"
+      state_init: "{{ state_init }}"
+      state_conflict: "{{ state_conflict }}"
+      force_rebuild: "{{ force_rebuild }}"
+
+# ---- Fast-exit if already correct ----
+- name: No changes needed (already correct)
+  ansible.builtin.debug:
+    msg: "PV in {{ vg_name }} and thin-pool '{{ thinpool_name }}' present."
+  when: state_correct
+  changed_when: false
+
+# ---- Repair path: PV/VG ok, just create thin-pool ----
+- name: Create thin pool LV (repair/create-only)
+  community.general.lvol:
+    vg: "{{ vg_name }}"
+    thinpool: "{{ thinpool_name }}"
+    size: "{{ thinpool_size }}"
+    state: present
+  when: state_repair and not thinpool_exists
+
+# ---- Init path: no PV -> create label, partition, PV, VG, thin-pool ----
+- name: Ensure GPT label on the disk (init)
+  ansible.builtin.command: "parted -s {{ data_device }} mklabel gpt"
+  when: state_init and (pttype | lower != 'gpt')
+
+- name: Inform kernel of table changes (init)
+  ansible.builtin.shell: "partprobe {{ data_device }} || true; udevadm settle"
+  when: state_init
+  changed_when: false
+
+- name: Create single LVM partition (explicit GPT) (init)
+  community.general.parted:
+    device: "{{ data_device }}"
+    label: gpt
+    number: 1
+    part_start: 1MiB
+    part_end: 100%
+    name: lvm
+    flags: [ lvm ]
+    state: present
+  when: state_init
+
+- name: Create PV on partition (init)
+  ansible.builtin.command: "pvcreate -ff -y {{ data_device }}1"
+  when: state_init
+
+- name: Create volume group (init)
+  community.general.lvg:
+    vg: "{{ vg_name }}"
+    pvs: "{{ data_device }}1"
+    pesize: 4M
+  when: state_init
+
+- name: Create thin pool LV (init)
+  community.general.lvol:
+    vg: "{{ vg_name }}"
+    thinpool: "{{ thinpool_name }}"
+    size: "{{ thinpool_size }}"
+  when: state_init
+
+# ---- Conflict path: PV exists but belongs to another VG ----
+- name: Fail on conflicting VG unless force_rebuild
+  ansible.builtin.fail:
+    msg: >
+      Found existing PV {{ pv_name }} in VG '{{ pv_vg }}', but expected VG '{{ vg_name }}'.
+      To rebuild (DESTROYS DATA) set 'force_rebuild: true', or rename your VG_name to adopt.
+  when: state_conflict and (not force_rebuild)
+
+# Optional destructive rebuild (only when explicitly forced)
+- name: Forced rebuild block
+  when: state_conflict and force_rebuild
+  block:
+    - name: Unmount any mountpoints on data device
+      ansible.builtin.shell: |
+        lsblk -nr -o MOUNTPOINT {{ data_device }} {{ data_device }}* | awk 'length($0)>1' || true
+      register: sda_mounts
+      changed_when: false
+    - name: Unmount paths
+      ansible.posix.mount:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ sda_mounts.stdout_lines | default([]) }}"
+    - name: Swapoff any swap on data device
+      ansible.builtin.shell: |
+        awk '$1 ~ "^{{ data_device }}" {print $1}' /proc/swaps | xargs -r -n1 swapoff
+      args: { executable: /bin/bash }
+      changed_when: false
+    - name: Deactivate any VGs on data device
+      ansible.builtin.shell: |
+        pvs --noheadings -o vg_name,pv_name --separator=: | \
+          awk -F: '$2 ~ "^ *{{ data_device }}" {gsub(/^ +| +$/,"",$1); print $1}' | sort -u | \
+          xargs -r -n1 vgchange -an
+      changed_when: false
+    - name: Settle udev
+      ansible.builtin.command: udevadm settle
+      changed_when: false
+
+    - name: Wipe signatures (DESTROYS DATA)
+      ansible.builtin.command: "wipefs -fa {{ data_device }}"
+
+    - name: Create GPT label (forced rebuild)
+      ansible.builtin.command: "parted -s {{ data_device }} mklabel gpt"
+
+    - name: Create LVM partition (forced rebuild)
+      community.general.parted:
+        device: "{{ data_device }}"
+        label: gpt
+        number: 1
+        part_start: 1MiB
+        part_end: 100%
+        name: lvm
+        flags: [ lvm ]
+        state: present
+
+    - name: Create PV (forced rebuild)
+      ansible.builtin.command: "pvcreate -ff -y {{ data_device }}1"
+
+    - name: Create VG (forced rebuild)
+      community.general.lvg:
+        vg: "{{ vg_name }}"
+        pvs: "{{ data_device }}1"
+        pesize: 4M
+
+    - name: Create thin pool LV (forced rebuild)
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        thinpool: "{{ thinpool_name }}"
+        size: "{{ thinpool_size }}"
+
+# ---- Thin-pool safety via conf.d drop-in ----
+- name: Ensure LVM conf.d directory exists
+  ansible.builtin.file:
+    path: /etc/lvm/lvm.conf.d
+    state: directory
+    mode: '0755'
+
+- name: Install thin autoextend drop-in
+  ansible.builtin.copy:
+    dest: /etc/lvm/lvm.conf.d/10-thin-autoextend.conf
+    mode: '0644'
+    content: |
+      activation {
+          thin_pool_autoextend_threshold = 70
+          thin_pool_autoextend_percent   = 5
+      }
+
+- name: Validate LVM config parses
+  ansible.builtin.command: lvmconfig --typeconfig full
+  changed_when: false
+
+- name: Ensure lvm2-monitor is enabled and running
+  ansible.builtin.systemd:
+    name: lvm2-monitor
+    state: started
+    enabled: true
